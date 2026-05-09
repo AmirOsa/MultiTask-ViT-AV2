@@ -1,13 +1,13 @@
 # Adapted from Nadeem Mohamed's IntentNetViT
 # Original repo: https://github.com/Nadeem202020/VisionTransformer-Intention-Prediction
-# Modifications: [describe what you changed, or "unchanged" if nothing]
+# Modifications: unchanged
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 import pandas as pd 
 from av2.map.map_api import ArgoverseStaticMap
 
-from constants import (INTENTIONS_MAP, INTENTION_HORIZON_STEPS, MIN_SPEED_STOPPED,
+from utils.constants import (INTENTIONS_MAP, INTENTION_HORIZON_STEPS, MIN_SPEED_STOPPED,
                        MIN_SPEED_MOVING, HEADING_CHANGE_THRESH_TURN,
                        HEADING_CHANGE_THRESH_LANE_KEEP, PARKED_MAX_DISP_M,
                        KEEP_LANE_MAX_LAT_DIST_FALLBACK, AV2_MAP_AVAILABLE, SHAPELY_AVAILABLE)
