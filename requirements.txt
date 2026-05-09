@@ -1,0 +1,15 @@
+torch>=2.0.0
+torchvision>=0.15.0
+timm>=0.9.0
+torch-geometric
+torch-scatter
+torch-sparse
+pytorch-lightning>=1.9.0
+numpy>=1.24.0
+pandas>=2.0.0
+pyarrow
+av2
+shapely
+scipy
+pyyaml
+tqdm
