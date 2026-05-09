@@ -1,6 +1,6 @@
 # Adapted from Nadeem Mohamed's IntentNetViT
 # Original repo: https://github.com/Nadeem202020/VisionTransformer-Intention-Prediction
-# Modifications: [describe what you changed, or "unchanged" if nothing]
+# Modifications: Updated import paths to match new repo structure. Logic unchanged.
 
 import argparse
 import time
@@ -10,10 +10,10 @@ from tqdm import tqdm
 import traceback 
 from collections import namedtuple
 
-from constants import (AV2_MAP_AVAILABLE, SHAPELY_AVAILABLE, VEHICLE_CATEGORIES,
+from utils.constants import (AV2_MAP_AVAILABLE, SHAPELY_AVAILABLE, VEHICLE_CATEGORIES,
                        INTENTIONS_MAP) 
-from dataset import ScenarioValidator 
-from heuristic_labeling import get_vehicle_intention_heuristic_enhanced
+from datasets.av2_dataset import ScenarioValidator 
+from utils.heuristic_labeling import get_vehicle_intention_heuristic_enhanced
 
 # --- Configuration ---
 OUTPUT_ANNOTATION_FILENAME = "annotations_with_intent.feather"
