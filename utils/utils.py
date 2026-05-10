@@ -1,7 +1,10 @@
 # Adapted from Nadeem Mohamed's IntentNetViT
 # Original repo: https://github.com/Nadeem202020/VisionTransformer-Intention-Prediction
-# Modifications: Updated import path from constants to utils.constants. 
-# All functions unchanged from Nadeem's original.
+# Modifications:
+# 1. Updated import path from constants to utils.constants
+# 2. augment_bev() modified to draw random values explicitly and
+#    return aug_params dict — enables synchronised trajectory augmentation
+#    in av2_dataset.py. All augmentation logic is otherwise unchanged.
 
 import torch
 import torchvision
@@ -506,24 +509,170 @@ def random_bev_dropout(lidar_bev: np.ndarray, map_bev: np.ndarray,
             map_bev[:, start_y:start_y+patch_h, start_x:start_x+patch_w] = 0.0 
     return lidar_bev, map_bev
 
-def augment_bev(lidar_bev: np.ndarray, map_bev: np.ndarray, gt_dict: dict
-                ) -> tuple[np.ndarray, np.ndarray, dict]:
-    """Applies a sequence of random BEV augmentations. Operates on NumPy arrays."""
-    gt_boxes_np = gt_dict['boxes_xywha'].clone().numpy() if isinstance(gt_dict['boxes_xywha'], torch.Tensor) else gt_dict['boxes_xywha'].copy()
-    gt_intentions_np = gt_dict['intentions'].clone().numpy() if isinstance(gt_dict['intentions'], torch.Tensor) else gt_dict['intentions'].copy()
-    
-    lidar_bev_aug, map_bev_aug = lidar_bev.copy(), map_bev.copy()
+def augment_bev(
+    lidar_bev: np.ndarray,
+    map_bev: np.ndarray,
+    gt_dict: dict
+) -> tuple[np.ndarray, np.ndarray, dict, dict]:
+    """
+    Applies a sequence of random BEV augmentations.
+    Operates on NumPy arrays.
 
-    lidar_bev_aug, map_bev_aug, gt_boxes_np, gt_intentions_np = random_flip_bev(lidar_bev_aug, map_bev_aug, gt_boxes_np, gt_intentions_np)
-    lidar_bev_aug, map_bev_aug, gt_boxes_np = random_rotate_bev(lidar_bev_aug, map_bev_aug, gt_boxes_np)
-    lidar_bev_aug, map_bev_aug, gt_boxes_np = random_scale_bev(lidar_bev_aug, map_bev_aug, gt_boxes_np)
+    MODIFICATION vs Nadeem's original:
+    Random values are now drawn explicitly and returned as aug_params
+    so that trajectory GT can be transformed with identical parameters.
+    This ensures BEV augmentation and trajectory augmentation are
+    perfectly synchronised.
+
+    Returns:
+        lidar_bev_aug:    augmented LiDAR BEV
+        map_bev_aug:      augmented map BEV
+        augmented_gt_dict: augmented GT boxes and intentions
+        aug_params: dict with keys:
+            flip_applied       bool
+            rotation_angle_rad float
+            scale_factor       float
+    """
+    gt_boxes_np = (
+        gt_dict['boxes_xywha'].clone().numpy()
+        if isinstance(gt_dict['boxes_xywha'], torch.Tensor)
+        else gt_dict['boxes_xywha'].copy()
+    )
+    gt_intentions_np = (
+        gt_dict['intentions'].clone().numpy()
+        if isinstance(gt_dict['intentions'], torch.Tensor)
+        else gt_dict['intentions'].copy()
+    )
+
+    lidar_bev_aug = lidar_bev.copy()
+    map_bev_aug = map_bev.copy()
+
+    # --- Draw all random decisions upfront ---
+    # MODIFICATION: previously these were drawn inside each sub-function
+    # Now drawn here once and passed explicitly so they can be returned
+    # and reused for trajectory augmentation
+    do_flip = random.random() < 0.5
+    do_rotate = random.random() < 0.5
+    rotation_deg = random.uniform(-15.0, 15.0) if do_rotate else 0.0
+    rotation_angle_rad = np.radians(rotation_deg)
+    do_scale = random.random() < 0.5
+    scale_factor = random.uniform(0.95, 1.05) if do_scale else 1.0
+
+    # --- Apply flip ---
+    if do_flip:
+        lidar_bev_aug = np.ascontiguousarray(np.flip(lidar_bev_aug, axis=2))
+        map_bev_aug = np.ascontiguousarray(np.flip(map_bev_aug, axis=2))
+        if gt_boxes_np.shape[0] > 0:
+            gt_boxes_np[:, 1] *= -1
+            gt_boxes_np[:, 4] *= -1
+            gt_boxes_np[:, 4] = np.arctan2(
+                np.sin(gt_boxes_np[:, 4]),
+                np.cos(gt_boxes_np[:, 4])
+            )
+        if gt_intentions_np.shape[0] > 0:
+            mapping = {
+                INTENTIONS_MAP["TURN_LEFT"]: INTENTIONS_MAP["TURN_RIGHT"],
+                INTENTIONS_MAP["TURN_RIGHT"]: INTENTIONS_MAP["TURN_LEFT"],
+                INTENTIONS_MAP["LEFT_CHANGE_LANE"]: INTENTIONS_MAP["RIGHT_CHANGE_LANE"],
+                INTENTIONS_MAP["RIGHT_CHANGE_LANE"]: INTENTIONS_MAP["LEFT_CHANGE_LANE"]
+            }
+            original_intentions = gt_intentions_np.copy()
+            for old_val, new_val in mapping.items():
+                gt_intentions_np[original_intentions == old_val] = new_val
+
+    # --- Apply rotation ---
+    if do_rotate:
+        center_px_x = GRID_WIDTH_PX / 2.0
+        center_px_y = GRID_HEIGHT_PX / 2.0
+        rot_mat_cv = cv2.getRotationMatrix2D(
+            (center_px_x, center_px_y), rotation_deg, 1.0
+        )
+
+        def rotate_all_channels(bev_tensor):
+            return np.stack([
+                cv2.warpAffine(
+                    bev_tensor[i], rot_mat_cv,
+                    (GRID_WIDTH_PX, GRID_HEIGHT_PX),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0
+                )
+                for i in range(bev_tensor.shape[0])
+            ], axis=0)
+
+        lidar_bev_aug = rotate_all_channels(lidar_bev_aug)
+        map_bev_aug = rotate_all_channels(map_bev_aug)
+
+        if gt_boxes_np.shape[0] > 0:
+            cx = gt_boxes_np[:, 0].copy()
+            cy = gt_boxes_np[:, 1].copy()
+            cos_a = np.cos(rotation_angle_rad)
+            sin_a = np.sin(rotation_angle_rad)
+            gt_boxes_np[:, 0] = cx * cos_a - cy * sin_a
+            gt_boxes_np[:, 1] = cx * sin_a + cy * cos_a
+            gt_boxes_np[:, 4] += rotation_angle_rad
+            gt_boxes_np[:, 4] = np.arctan2(
+                np.sin(gt_boxes_np[:, 4]),
+                np.cos(gt_boxes_np[:, 4])
+            )
+
+    # --- Apply scale ---
+    if do_scale:
+        new_h = int(GRID_HEIGHT_PX * scale_factor)
+        new_w = int(GRID_WIDTH_PX * scale_factor)
+
+        def scale_all_channels(bev_tensor):
+            scaled_channels = []
+            for i in range(bev_tensor.shape[0]):
+                resized = cv2.resize(
+                    bev_tensor[i], (new_w, new_h),
+                    interpolation=cv2.INTER_LINEAR
+                )
+                final = np.zeros(
+                    (GRID_HEIGHT_PX, GRID_WIDTH_PX),
+                    dtype=bev_tensor.dtype
+                )
+                if scale_factor > 1.0:
+                    h_start = (new_h - GRID_HEIGHT_PX) // 2
+                    w_start = (new_w - GRID_WIDTH_PX) // 2
+                    final = resized[
+                        h_start:h_start + GRID_HEIGHT_PX,
+                        w_start:w_start + GRID_WIDTH_PX
+                    ]
+                else:
+                    h_start = (GRID_HEIGHT_PX - new_h) // 2
+                    w_start = (GRID_WIDTH_PX - new_w) // 2
+                    final[
+                        h_start:h_start + new_h,
+                        w_start:w_start + new_w
+                    ] = resized
+                scaled_channels.append(final)
+            return np.stack(scaled_channels, axis=0)
+
+        lidar_bev_aug = scale_all_channels(lidar_bev_aug)
+        map_bev_aug = scale_all_channels(map_bev_aug)
+
+        if gt_boxes_np.shape[0] > 0:
+            gt_boxes_np[:, :4] *= scale_factor
+
+    # --- Apply dropout (no parameters needed — doesn't affect GT) ---
     lidar_bev_aug, map_bev_aug = random_bev_dropout(lidar_bev_aug, map_bev_aug)
 
     augmented_gt_dict = {
         'boxes_xywha': torch.from_numpy(gt_boxes_np).float(),
         'intentions': torch.from_numpy(gt_intentions_np).long()
     }
-    return lidar_bev_aug, map_bev_aug, augmented_gt_dict
+
+    # --- Return augmentation parameters ---
+    # MODIFICATION: new return value so __getitem__ can apply
+    # identical transformation to trajectory GT
+    aug_params = {
+        'flip_applied': do_flip,
+        'rotation_angle_rad': rotation_angle_rad,
+        'scale_factor': scale_factor if do_scale else 1.0
+    }
+
+    return lidar_bev_aug, map_bev_aug, augmented_gt_dict, aug_params
 
 def generate_anchors(bev_height: int = GRID_HEIGHT_PX, bev_width: int = GRID_WIDTH_PX,
                      feature_map_stride: int = 8,
