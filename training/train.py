@@ -283,7 +283,6 @@ if __name__ == '__main__':
     loss_fn = MultiTaskLoss(
         use_rotated_iou=USE_ROTATED_IOU,
         apply_intention_downsampling=APPLY_DOWNSAMPLE,
-        intention_downsample_ratio=DOWNSAMPLE_RATIO,
         box_weight=BOX_WEIGHT,
         cls_weight=CLS_WEIGHT,
         intent_weight=INTENT_WEIGHT,
