@@ -706,9 +706,14 @@ class ArgoverseIntentNetDataset(Dataset):
             map_bev_np = rasterize_map_ego_centric(map_json_path, current_ego_pose)
 
             # --- Get GT boxes and intentions ---
-            # Unchanged from Nadeem's original
+            # MODIFICATION: pass ego_SE3_world so prepare_gt_for_frame() can
+            # transform city-frame positions back to ego frame.
+            # ego_SE3_world is already computed above for LiDAR sweep alignment.
             frame_gt_dict = prepare_gt_for_frame(
-                current_ts_ns, gt_df_with_intent, map_api
+                current_ts_ns,
+                gt_df_with_intent,
+                map_api,
+                ego_SE3_world=ego_SE3_world
             )
 
             # =================================================================

@@ -1,0 +1,166 @@
+# configs/v3_swin.yaml
+#
+# IntentTrajNet-AV2 — V3 Configuration
+# Full upgrade: Swin-T pretrained backbone + transformer trajectory decoder
+#               + 5-second agent history from converted parquet files
+#
+# Research question:
+#   Does a pretrained hierarchical backbone + richer temporal history
+#   + transformer decoder improve both trajectory and intention performance?
+#
+# Key differences from V2:
+#   1. Backbone: vit_small_patch8 (scratch) → swin_tiny_patch4 (pretrained)
+#      SOURCED: Swin Transformer — Liu et al., ICCV 2021 Best Paper
+#      SOURCED: pretrained ViT transfers to LiDAR — RangeViT, CVPR 2023
+#
+#   2. Trajectory decoder: MLP → transformer cross-attention over BEV
+#      SOURCED: Abdulbaki thesis Section 5.3 — transformer decoder is
+#      listed explicitly as future work
+#
+#   3. Agent history: 1s implicit (BEV sweeps) → 5s explicit (parquet)
+#      SOURCED: 5 seconds from Abdulbaki thesis Section 3.1
+
+# ─────────────────────────────────────────────
+# Model
+# ─────────────────────────────────────────────
+model:
+  version: "V3"
+  use_trajectory: true
+
+  backbone:
+    type: "swin"
+    # SOURCED: Swin Transformer — Liu et al., ICCV 2021
+    swin_model_name: "swin_tiny_patch4_window7_224"
+    pretrained: true
+    # True → ImageNet pretrained weights loaded via timm
+    # SOURCED: RangeViT (CVPR 2023) — ImageNet pretrained ViTs transfer
+    # to LiDAR data despite domain gap. timm handles channel mismatch
+    # (290ch vs 3ch) via mean-and-repeat initialisation automatically.
+    window_size: 5
+    # NEEDS TEST: must divide feature map dimensions evenly
+    # feature map = img_size / patch_size = 400/4=100, 720/4=180
+    # window_size=5: 100/5=20 ✓, 180/5=36 ✓
+    # window_size=4: 100/4=25 ✓, 180/4=45 ✓ (alternative if 5 fails)
+    out_channels: 512
+    # Must match V1/V2 feature channels so heads work unchanged
+    # SOURCED: 512 from Nadeem thesis Section 3.3
+
+  trajectory:
+    decoder_type: "transformer"
+    # Transformer cross-attention decoder
+    # Mode queries cross-attend to full BEV feature map
+    # SOURCED conceptually: Abdulbaki thesis Section 5.3 explicitly
+    # lists transformer decoder as future work
+    future_steps: 60
+    # SOURCED: Abdulbaki thesis Section 3.1
+    num_modes: 6
+    # SOURCED: Abdulbaki thesis Section 3.4.3
+    hidden_size: 256
+    # NEEDS TEST: ablation over {128, 256, 512}
+    min_scale: 0.001
+    # SOURCED: HiVT decoder.py
+
+    # Cross-attention transformer decoder params
+    num_heads: 8
+    # ASSUMED: standard transformer num_heads
+    # Must divide hidden_size evenly: 256/8=32 ✓
+    num_decoder_layers: 2
+    # ASSUMED: shallow decoder to avoid overfitting on limited data
+    # 2 layers is conservative — 4 is standard but heavier
+
+  history:
+    use_agent_history: true
+    # True → load 5-second agent history from converted parquet files
+    history_steps: 50
+    # SOURCED: Abdulbaki thesis Section 3.1 — 5 seconds × 10Hz
+    history_features: 5
+    # SOURCED: Abdulbaki thesis Section 3.6
+    # f^t_i = [p^t_i, v^t_i, h^t_i] ∈ R^5
+    # position (x,y) + velocity (vx,vy) + heading (1)
+    history_encoder_hidden: 64
+    # ASSUMED: small encoder — maps [50,5] → [64] history vector
+    # Then fused with BEV features: [N, 512+64] = [N, 576]
+
+# ─────────────────────────────────────────────
+# Data
+# ─────────────────────────────────────────────
+data:
+  train_dir: "/content/drive/MyDrive/Amir_Dataset/ViT-project/av2/sensor/train"
+  val_dir:   "/content/drive/MyDrive/Amir_Dataset/ViT-project/av2/sensor/val"
+  future_traj: true
+  gt_frame: "ego"
+
+  parquet_dir: "/content/drive/MyDrive/Amir_Dataset/HiVT-project_SMF/av2/motion-forecasting"
+  # Converted parquet files from sensor_to_mf.py
+  # Contains 5-second agent history for each scene
+  # SOURCED: your conversion script — sensor_to_mf.py
+
+# ─────────────────────────────────────────────
+# Training
+# ─────────────────────────────────────────────
+training:
+  batch_size: 8
+  # Same as V1/V2 — Swin-T has similar memory footprint to ViT-S
+  num_epochs: 10
+  num_workers: 0
+
+  optimizer:
+    type: "AdamW"
+    lr_backbone: 0.00001
+    # Lower LR for pretrained Swin backbone
+    # SOURCED: standard practice — pretrained layers use 10× lower LR
+    # than randomly initialised layers. Prevents destroying pretrained
+    # features before the new heads have learned useful gradients.
+    lr_heads: 0.0001
+    # Standard LR for new heads (detection, intention, trajectory)
+    # SOURCED: Nadeem thesis Section 3.4 — 1e-4 for new layers
+    weight_decay: 0.0001
+
+  scheduler:
+    type: "ReduceLROnPlateau"
+    mode: "min"
+    factor: 0.1
+    patience: 3
+
+# ─────────────────────────────────────────────
+# Loss
+# ─────────────────────────────────────────────
+loss:
+  use_rotated_iou: false
+  apply_intention_downsampling: true
+  intention_downsample_ratio: 0.85
+
+  iou_threshold: 0.6
+  neg_iou_threshold: 0.45
+  box_weight: 1.0
+  cls_weight: 1.0
+  intent_weight: 0.5
+
+  traj_lambda: 0.1
+  # NEEDS TEST: same ablation as V2 — {0.01, 0.1, 0.5, 1.0}
+  # V3's better trajectory predictions may allow higher lambda
+  # without negative transfer — test after V2 ablation is done
+
+# ─────────────────────────────────────────────
+# Evaluation
+# ─────────────────────────────────────────────
+eval:
+  confidence_threshold: 0.1
+  nms_iou_threshold: 0.2
+  use_rotated_iou: false
+  batch_size: 8
+
+  trajectory_metrics:
+    miss_rate_threshold_m: 2.0
+    # SOURCED: Abdulbaki thesis Section 3.7
+
+# ─────────────────────────────────────────────
+# Checkpoints
+# ─────────────────────────────────────────────
+checkpoints:
+  save_dir: "/content/drive/MyDrive/Amir_Dataset/IntentTrajNet_checkpoints"
+  filename: "intenttrajnet_v3.pth"
+  pretrained_v2: ""
+  # Optional: initialise from V2 checkpoint
+  # Backbone weights transfer, trajectory head re-initialises
+  # for the new Swin architecture

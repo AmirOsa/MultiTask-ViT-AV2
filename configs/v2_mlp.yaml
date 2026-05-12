@@ -1,0 +1,136 @@
+# configs/v2_mlp.yaml
+#
+# IntentTrajNet-AV2 — V2 Configuration
+# Multi-task: detection + intention + MLP trajectory decoder
+# Same ViT backbone as V1 — isolates the effect of adding trajectory head
+#
+# Research question:
+#   Does adding trajectory prediction improve intention accuracy
+#   through shared backbone learning?
+
+# ─────────────────────────────────────────────
+# Model
+# ─────────────────────────────────────────────
+model:
+  version: "V2"
+  use_trajectory: true
+  # True → TrajectoryHead created with MLP decoder (BEVTrajectoryDecoder)
+
+  backbone:
+    type: "vit"
+    # SOURCED: same as V1 — Nadeem thesis Section 3.3
+    # Keeping backbone identical to V1 isolates the contribution
+    # of the trajectory head to any performance difference
+    vit_model_name_lidar: "vit_small_patch8_224"
+    vit_model_name_map: "vit_small_patch8_224"
+    pretrained_lidar: false
+    pretrained_map: false
+    lidar_adapter_out_channels: 192
+    map_adapter_out_channels: 192
+    fusion_block_planes: 512
+    fusion_block_layers: 2
+    fusion_block_kernel_size: 3
+    fusion_block_stride: 1
+
+  trajectory:
+    decoder_type: "mlp"
+    # MLP decoder adapted from HiVT MLPDecoder
+    # SOURCED: Abdulbaki thesis Section 3.4.3
+    future_steps: 60
+    # SOURCED: Abdulbaki thesis Section 3.1 — 6 seconds × 10Hz
+    num_modes: 6
+    # SOURCED: Abdulbaki thesis Section 3.4.3
+    hidden_size: 256
+    # NEEDS TEST: ablation over {128, 256, 512}
+    # Start with 256 — wider than HiVT's 64 to match richer BEV features
+    min_scale: 0.001
+    # SOURCED: HiVT decoder.py
+
+# ─────────────────────────────────────────────
+# Data
+# ─────────────────────────────────────────────
+data:
+  train_dir: "/content/drive/MyDrive/Amir_Dataset/ViT-project/av2/sensor/val"
+  val_dir:   "/content/drive/MyDrive/Amir_Dataset/ViT-project/av2/sensor/val"
+  future_traj: true
+  # True → dataset loads future_traj_ego [N,60,2] and future_traj_mask [N,60]
+  # from annotations_with_intent.feather (precomputed city-frame GT)
+  gt_frame: "ego"
+  # Trajectory GT in ego frame — consistent with BEV representation
+  # SOURCED: consistent with prepare_gt_for_frame() in utils.py
+
+# ─────────────────────────────────────────────
+# Training
+# ─────────────────────────────────────────────
+training:
+  batch_size: 8
+  num_epochs: 2
+  num_workers: 0
+
+  optimizer:
+    type: "AdamW"
+    lr: 0.0001
+    weight_decay: 0.0001
+    # SOURCED: Nadeem thesis Section 3.4 — same as V1 for fair comparison
+
+  scheduler:
+    type: "ReduceLROnPlateau"
+    mode: "min"
+    factor: 0.1
+    patience: 3
+
+# ─────────────────────────────────────────────
+# Loss
+# ─────────────────────────────────────────────
+loss:
+  use_rotated_iou: false
+  apply_intention_downsampling: true
+  intention_downsample_ratio: 0.85
+
+  iou_threshold: 0.6
+  neg_iou_threshold: 0.45
+  box_weight: 1.0
+  cls_weight: 1.0
+  intent_weight: 0.5
+  # SOURCED: Nadeem thesis Section 3.4 — unchanged from V1
+
+  traj_lambda: 0.1
+  # NEEDS TEST: ablation over {0.01, 0.1, 0.5, 1.0}
+  # Run 3 epochs on 5 logs for each value.
+  # Select where:
+  #   - trajectory loss visibly decreases over 3 epochs
+  #   - detection mAP stays within ~5% of V1 baseline
+  # Reference: Caruana (1997) multi-task learning — auxiliary tasks
+  # benefit primary task when properly weighted.
+
+  # Trajectory loss components
+  # SOURCED: Abdulbaki thesis Section 3.8
+  # L_traj = L_reg_WTA (Laplace NLL) + L_cls (cross-entropy on modes)
+  # L_total = L_det_intent + traj_lambda × L_traj
+
+# ─────────────────────────────────────────────
+# Evaluation
+# ─────────────────────────────────────────────
+eval:
+  confidence_threshold: 0.1
+  nms_iou_threshold: 0.2
+  use_rotated_iou: false
+  batch_size: 8
+
+  trajectory_metrics:
+    # All metric definitions SOURCED: Abdulbaki thesis Section 3.7
+    miss_rate_threshold_m: 2.0
+    # SOURCED: Abdulbaki thesis — "endpoint exceeds 2.0 meters"
+
+# ─────────────────────────────────────────────
+# Checkpoints
+# ─────────────────────────────────────────────
+checkpoints:
+  save_dir: "/content/drive/MyDrive/Amir_Dataset/IntentTrajNet_checkpoints"
+  filename: "intenttrajnet_v2.pth"
+  pretrained_v1: ""
+  # Optional: path to V1 checkpoint to initialise backbone weights
+  # Leaving empty → backbone trains from scratch (same as V1)
+  # Filling this → backbone starts from V1 pretrained weights,
+  # only trajectory head trains from scratch
+  # SOURCED: standard transfer learning practice
