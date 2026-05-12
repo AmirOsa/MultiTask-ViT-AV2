@@ -24,6 +24,9 @@
 #      NEEDS TEST: ablation over {128, 256, 512} recommended.
 #   5. All core logic (aggr_embed, loc, scale, pi, Laplace parameterisation,
 #      output shapes [F,N,H,4] and [N,F]) is unchanged from HiVT MLPDecoder.
+#   6. BUG FIX: renamed local variable F → num_modes inside forward() to
+#      avoid shadowing the torch.nn.functional import (also aliased as F).
+#      Previously caused: AttributeError: 'int' object has no attribute 'elu_'
 #
 # SOURCED values:
 #   future_steps = 60    — Abdulbaki thesis Section 3.1
@@ -70,15 +73,15 @@ class BEVTrajectoryDecoder(nn.Module):
             feat_dim = backbone_channels + 4 = 512 + 4 = 516.
 
     Output:
-        y_hat [F, N, H, 4]
-            F=6 trajectory modes, N agents, H=60 future timesteps,
+        y_hat [num_modes, N, H, 4]
+            num_modes=6 trajectory modes, N agents, H=60 future timesteps,
             4 values per step = (µx, µy, bx, by) in Laplace parameterisation.
             µx, µy: predicted position.
             bx, by: predicted scale (uncertainty).
             SOURCED: output format from HiVT MLPDecoder and
             Abdulbaki thesis Section 3.4.3.
 
-        pi [N, F]
+        pi [N, num_modes]
             Raw logits for mode probabilities.
             softmax(pi) gives the probability of each of the 6 modes.
             SOURCED: HiVT MLPDecoder forward() return value.
@@ -86,9 +89,9 @@ class BEVTrajectoryDecoder(nn.Module):
     How mode_queries replace HiVT's global_embed:
         In HiVT, global_embed [F, N, dk] comes from the global interaction
         module — it encodes social context between agents via a graph.
-        We have no graph encoder. Instead, mode_queries [F, hidden_size]
-        are F learned parameter vectors, one per trajectory mode.
-        During forward(), they are expanded to [F, N, hidden_size] and
+        We have no graph encoder. Instead, mode_queries [num_modes, hidden_size]
+        are num_modes learned parameter vectors, one per trajectory mode.
+        During forward(), they are expanded to [num_modes, N, hidden_size] and
         combined with the agent feature. The model learns to specialise
         each mode query for a different type of future behaviour
         (e.g. straight, left turn, right turn, stop, etc.).
@@ -116,8 +119,8 @@ class BEVTrajectoryDecoder(nn.Module):
 
         uncertain: bool = True,
         # If True, predict Laplace scale (bx, by) alongside location.
-        # Output is [F, N, H, 4] = (µx, µy, bx, by).
-        # If False, output is [F, N, H, 2] = (µx, µy) only.
+        # Output is [num_modes, N, H, 4] = (µx, µy, bx, by).
+        # If False, output is [num_modes, N, H, 2] = (µx, µy) only.
         # SOURCED: HiVT MLPDecoder uses uncertain=True by default.
 
         min_scale: float = TRAJECTORY_MIN_SCALE,
@@ -136,11 +139,11 @@ class BEVTrajectoryDecoder(nn.Module):
 
         # ---------------------------------------------------------------------
         # Learnable mode query vectors
-        # Shape: [F, hidden_size] = [6, 256]
+        # Shape: [num_modes, hidden_size] = [6, 256]
         #
-        # Each of the F vectors represents one trajectory "mode" or hypothesis.
-        # During forward(), they are expanded to [F, N, hidden_size] so every
-        # agent gets all F mode queries applied.
+        # Each of the num_modes vectors represents one trajectory "mode".
+        # During forward(), they are expanded to [num_modes, N, hidden_size]
+        # so every agent gets all num_modes mode queries applied.
         #
         # MODIFICATION vs HiVT: in HiVT, global_embed [F, N, dk] comes from
         # the global interaction encoder. Here it is a learned parameter.
@@ -168,12 +171,10 @@ class BEVTrajectoryDecoder(nn.Module):
         # ---------------------------------------------------------------------
         # Aggregation MLP
         # Fuses mode query + projected agent feature → per-mode hidden vector
-        # Input:  [F, N, hidden_size + hidden_size] = [F, N, 512]
-        # Output: [F, N, hidden_size] = [F, N, 256]
+        # Input:  [num_modes, N, hidden_size + hidden_size]
+        # Output: [num_modes, N, hidden_size]
         #
         # SOURCED: identical structure to HiVT MLPDecoder.aggr_embed
-        # Input was (global_embed + local_embed), output was hidden_size.
-        # Here (mode_query + agent_proj) replaces (global + local).
         # ---------------------------------------------------------------------
         self.aggr_embed = nn.Sequential(
             nn.Linear(hidden_size + hidden_size, hidden_size),
@@ -184,9 +185,8 @@ class BEVTrajectoryDecoder(nn.Module):
         # ---------------------------------------------------------------------
         # Location head
         # Predicts µx, µy for all future timesteps in one shot.
-        # Input:  [F, N, hidden_size]
-        # Output: [F, N, future_steps * 2] → reshape → [F, N, future_steps, 2]
-        #
+        # Input:  [num_modes, N, hidden_size]
+        # Output: [num_modes, N, future_steps, 2]
         # SOURCED: identical to HiVT MLPDecoder.loc
         # ---------------------------------------------------------------------
         self.loc = nn.Sequential(
@@ -199,9 +199,8 @@ class BEVTrajectoryDecoder(nn.Module):
         # ---------------------------------------------------------------------
         # Scale head (uncertainty)
         # Predicts bx, by (Laplace scale) for all future timesteps.
-        # Input:  [F, N, hidden_size]
-        # Output: [F, N, future_steps * 2] → reshape → [F, N, future_steps, 2]
-        #
+        # Input:  [num_modes, N, hidden_size]
+        # Output: [num_modes, N, future_steps, 2]
         # SOURCED: identical to HiVT MLPDecoder.scale
         # Only created when uncertain=True.
         # ---------------------------------------------------------------------
@@ -216,11 +215,9 @@ class BEVTrajectoryDecoder(nn.Module):
         # ---------------------------------------------------------------------
         # Mode probability head
         # Predicts one logit per mode per agent.
-        # Input:  [F, N, hidden_size + hidden_size] (mode_query + agent_proj)
-        # Output: [F, N, 1] → squeeze → [N, F]
-        #
+        # Input:  [num_modes, N, hidden_size + hidden_size]
+        # Output: [num_modes, N, 1] → squeeze → [N, num_modes]
         # SOURCED: identical to HiVT MLPDecoder.pi
-        # softmax(pi) gives probability of each mode being the correct future.
         # ---------------------------------------------------------------------
         self.pi = nn.Sequential(
             nn.Linear(hidden_size + hidden_size, hidden_size),
@@ -236,8 +233,8 @@ class BEVTrajectoryDecoder(nn.Module):
         # SOURCED: same as HiVT which calls self.apply(init_weights)
         self.apply(_init_weights)
 
-        # Re-initialise mode_queries after apply() since apply()
-        # would have tried to initialise it as a Linear (it's a Parameter)
+        # Re-initialise mode_queries after apply() — apply() skips Parameters
+        # but we re-initialise explicitly for safety
         nn.init.normal_(self.mode_queries, mean=0.0, std=0.1)
 
     def forward(
@@ -253,84 +250,91 @@ class BEVTrajectoryDecoder(nn.Module):
                 N = number of detected vehicles in this batch element.
 
         Returns:
-            y_hat: [F, N, H, 4]
+            y_hat: [num_modes, N, H, 4]
                 Trajectory predictions in Laplace parameterisation.
-                F=6 modes, N agents, H=60 timesteps, 4=(µx,µy,bx,by).
+                num_modes=6, N agents, H=60 timesteps, 4=(µx,µy,bx,by).
                 Positions are in ego frame (metres).
                 SOURCED: output format from HiVT MLPDecoder.
 
-            pi: [N, F]
+            pi: [N, num_modes]
                 Raw mode logits. Apply softmax to get probabilities.
                 SOURCED: HiVT MLPDecoder forward() return value.
+
+        BUG FIX NOTE:
+            The local variable is named num_modes (not F) to avoid
+            shadowing the torch.nn.functional import which is also
+            aliased as F at the top of this file.
+            Using F = self.num_modes caused:
+            AttributeError: 'int' object has no attribute 'elu_'
+            because F.elu_() was called on the integer 6 instead of
+            torch.nn.functional.elu_().
         """
         N = agent_feat.shape[0]
-        F = self.num_modes
+        num_modes = self.num_modes
+        # BUG FIX: was F = self.num_modes which shadowed
+        # torch.nn.functional (imported as F above)
 
         # --- Step 1: Project agent feature ---
         # [N, feat_dim] → [N, hidden_size]
         # MODIFICATION: added vs HiVT (HiVT local_embed was already hidden_size)
-        agent_hidden = self.agent_proj(agent_feat)  # [N, hidden_size]
+        agent_hidden = self.agent_proj(agent_feat)
+        # [N, hidden_size]
 
         # --- Step 2: Expand mode queries for all agents ---
-        # mode_queries: [F, hidden_size]
-        # Expand to:    [F, N, hidden_size]
-        # Each agent gets all F mode queries applied independently.
-        mode_q = self.mode_queries.unsqueeze(1).expand(F, N, self.hidden_size)
-        # [F, hidden_size] → [F, 1, hidden_size] → [F, N, hidden_size]
+        # mode_queries: [num_modes, hidden_size]
+        # Expand to:    [num_modes, N, hidden_size]
+        mode_q = self.mode_queries.unsqueeze(1).expand(
+            num_modes, N, self.hidden_size
+        )
+        # [num_modes, 1, hidden_size] → [num_modes, N, hidden_size]
 
         # --- Step 3: Expand agent feature for all modes ---
         # agent_hidden: [N, hidden_size]
-        # Expand to:    [F, N, hidden_size]
-        agent_expanded = agent_hidden.unsqueeze(0).expand(F, N, self.hidden_size)
-        # [N, hidden_size] → [1, N, hidden_size] → [F, N, hidden_size]
+        # Expand to:    [num_modes, N, hidden_size]
+        agent_expanded = agent_hidden.unsqueeze(0).expand(
+            num_modes, N, self.hidden_size
+        )
+        # [1, N, hidden_size] → [num_modes, N, hidden_size]
 
         # --- Step 4: Compute mode probabilities ---
-        # Concatenate mode_query + agent_feature: [F, N, 2*hidden_size]
-        # Pass through pi MLP: [F, N, 1]
-        # Squeeze and transpose: [N, F]
         # SOURCED: identical logic to HiVT MLPDecoder.forward() pi computation
         pi_input = torch.cat([mode_q, agent_expanded], dim=-1)
-        # [F, N, 2*hidden_size]
+        # [num_modes, N, 2*hidden_size]
         pi = self.pi(pi_input).squeeze(-1).t()
-        # [F, N, 1] → [F, N] → [N, F]
+        # [num_modes, N, 1] → [num_modes, N] → [N, num_modes]
 
         # --- Step 5: Aggregate mode query + agent feature ---
-        # Concatenate: [F, N, 2*hidden_size]
-        # Pass through aggr_embed: [F, N, hidden_size]
         # SOURCED: identical to HiVT aggr_embed(cat(global_embed, local_embed))
         aggr_input = torch.cat([mode_q, agent_expanded], dim=-1)
-        # [F, N, 2*hidden_size]
+        # [num_modes, N, 2*hidden_size]
         out = self.aggr_embed(aggr_input)
-        # [F, N, hidden_size]
+        # [num_modes, N, hidden_size]
 
         # --- Step 6: Predict locations ---
-        # [F, N, hidden_size] → [F, N, future_steps*2] → [F, N, future_steps, 2]
         # SOURCED: identical to HiVT MLPDecoder loc head
-        loc = self.loc(out).view(F, N, self.future_steps, 2)
-        # [F, N, H, 2] where H = future_steps = 60
+        loc = self.loc(out).view(num_modes, N, self.future_steps, 2)
+        # [num_modes, N, H, 2]
 
-        # --- Step 7: Predict scales (uncertainty) and build output ---
+        # --- Step 7: Predict scales and build output ---
         # SOURCED: identical to HiVT MLPDecoder scale head and output assembly
         if self.uncertain:
-            scale = self.scale(out).view(F, N, self.future_steps, 2)
-            # [F, N, H, 2]
+            scale = self.scale(out).view(num_modes, N, self.future_steps, 2)
+            # [num_modes, N, H, 2]
 
-            # ELU activation + 1.0 + min_scale ensures scale > min_scale > 0
-            # This prevents the Laplace distribution from becoming infinitely
-            # peaked (scale → 0 would cause NaN in log-likelihood loss)
-            # SOURCED: identical to HiVT — F.elu_(scale) + 1.0 + min_scale
+            # ELU + 1.0 + min_scale ensures scale > min_scale > 0
+            # Prevents Laplace distribution from collapsing to zero width
+            # SOURCED: HiVT — F.elu_(scale) + 1.0 + min_scale
+            # NOTE: F here is torch.nn.functional (the import) NOT num_modes
             scale = F.elu_(scale, alpha=1.0) + 1.0 + self.min_scale
-            # [F, N, H, 2]
+            # [num_modes, N, H, 2]
 
-            # Concatenate loc and scale along last dimension
-            # Output: [F, N, H, 4] = (µx, µy, bx, by) per timestep
+            # Concatenate loc and scale → (µx, µy, bx, by) per timestep
             y_hat = torch.cat([loc, scale], dim=-1)
-            # [F, N, H, 4]
+            # [num_modes, N, H, 4]
         else:
-            # Without uncertainty: output only locations
             y_hat = loc
-            # [F, N, H, 2]
+            # [num_modes, N, H, 2]
 
         return y_hat, pi
-        # y_hat: [F, N, H, 4]  — trajectory predictions
-        # pi:    [N, F]         — mode logits
+        # y_hat: [num_modes, N, H, 4]  — trajectory predictions
+        # pi:    [N, num_modes]         — mode logits
