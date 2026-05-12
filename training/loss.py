@@ -403,7 +403,7 @@ class TrajectoryLoss(nn.Module):
         """
         device = y_hat.device
         N = y_hat.shape[1]  # number of vehicles
-        F = self.num_modes
+        num_modes  = self.num_modes
         H = self.future_steps
 
         # Handle empty batch — no vehicles detected
@@ -433,11 +433,11 @@ class TrajectoryLoss(nn.Module):
         # [F, N, H, 2]
 
         # GT positions expanded for comparison across all F modes
-        gt_expanded = gt_traj.unsqueeze(0).expand(F, N, H, 2)
+        gt_expanded = gt_traj.unsqueeze(0).expand(num_modes, N, H, 2)
         # [F, N, H, 2]
 
         # Mask expanded for all modes
-        mask_expanded = gt_mask.unsqueeze(0).expand(F, N, H)
+        mask_expanded = gt_mask.unsqueeze(0).expand(num_modes, N, H)
         # [F, N, H]
 
         # L2 distance at each timestep, summed over x and y
