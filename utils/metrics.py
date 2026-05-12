@@ -87,7 +87,7 @@ def compute_trajectory_metrics(
     """
     device = y_hat.device
     N = y_hat.shape[1]
-    F = y_hat.shape[0]
+    num_modes  = y_hat.shape[0]
     H = y_hat.shape[2]
 
     if N == 0:
@@ -103,10 +103,10 @@ def compute_trajectory_metrics(
     # [F, N, H, 2]
 
     # Expand GT for comparison across all F modes
-    gt_expanded = gt_traj.unsqueeze(0).expand(F, N, H, 2)
+    gt_expanded = gt_traj.unsqueeze(0).expand(num_modes, N, H, 2)
     # [F, N, H, 2]
 
-    mask_expanded = gt_mask.unsqueeze(0).expand(F, N, H).float()
+    mask_expanded = gt_mask.unsqueeze(0).expand(num_modes, N, H).float()
     # [F, N, H]
 
     # L2 distance at each timestep per mode per vehicle
@@ -150,9 +150,9 @@ def compute_trajectory_metrics(
     # [N] — index of last valid timestep
 
     # Gather L2 at last valid timestep for each mode
-    last_idx_expanded = last_valid_idx.view(1, N, 1).expand(F, N, 1)
+    last_idx_expanded = last_valid_idx.view(1, N, 1).expand(num_modes, N, 1)
     l2_at_last = l2_per_step.gather(2, last_idx_expanded).squeeze(-1)
-    # [F, N]
+    # [num_modes, N]
 
     # Minimum across modes
     min_fde_per_vehicle, best_mode_fde = l2_at_last.min(dim=0)
