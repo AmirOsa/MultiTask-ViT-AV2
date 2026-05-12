@@ -16,6 +16,9 @@
 #   8. All original training logic unchanged (AdamW, ReduceLROnPlateau,
 #      NaN detection, progress bar, checkpoint saving)
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 from torch.utils.data import DataLoader
 import numpy as np
