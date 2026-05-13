@@ -14,6 +14,9 @@ from utils.constants import (AV2_MAP_AVAILABLE, SHAPELY_AVAILABLE, VEHICLE_CATEG
                        INTENTIONS_MAP) 
 from datasets.av2_dataset import ScenarioValidator 
 from utils.heuristic_labeling import get_vehicle_intention_heuristic_enhanced
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # --- Configuration ---
 OUTPUT_ANNOTATION_FILENAME = "annotations_with_intent.feather"
