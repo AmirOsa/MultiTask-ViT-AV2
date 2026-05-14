@@ -383,92 +383,64 @@ class ArgoverseIntentNetDataset(Dataset):
         track_id: str,
         current_ts_ns: int,
         gt_df: pd.DataFrame,
+        ego_poses_df: pd.DataFrame,   # NEW — need future ego poses
         ego_SE3_world: np.ndarray,
         future_steps: int = TRAJECTORY_FUTURE_STEPS
     ) -> tuple:
-        """
-        NEW METHOD — Added for trajectory prediction (V2 and V3).
 
-        Extracts the future trajectory of one vehicle in ego frame.
-
-        How it works:
-            1. Filter annotations to this vehicle's future rows only
-            2. Take the next `future_steps` rows (max 60)
-            3. Transform world-frame (x,y) positions to ego-frame
-               using ego_SE3_world (the inverse of the ego pose matrix)
-            4. Return positions and a validity mask
-
-        Why ego frame?
-            The BEV is ego-centric so trajectory GT must match.
-            SOURCED: consistent with prepare_gt_for_frame() in utils.py
-            which also uses ego-frame positions for GT boxes.
-
-        Why a validity mask?
-            Not all vehicles have 60 future timesteps. A vehicle that
-            leaves the sensor range after 2 seconds only has 20 future
-            observations. The mask tells the loss function which timesteps
-            are real data and which are zero-padding.
-
-        Why z = 0?
-            ASSUMED: annotations store only (x, y) per timestep.
-            We add z=0 to satisfy transform_points() which expects 3D.
-            z is immediately discarded after transformation.
-            Valid under the standard BEV flat-ground assumption used
-            throughout this codebase.
-
-        Args:
-            track_id:      unique vehicle ID string
-            current_ts_ns: current timestamp in nanoseconds
-            gt_df:         full annotations DataFrame for this log
-            ego_SE3_world: 4x4 matrix transforming world to ego frame
-            future_steps:  number of future timesteps to extract
-                           SOURCED: 60 from Abdulbaki thesis Section 3.1
-
-        Returns:
-            traj: np.ndarray [future_steps, 2]
-                  x,y in ego frame — zero where data is missing
-            mask: np.ndarray [future_steps] bool
-                  True = valid observation, False = zero-padded
-        """
-        # Initialise output — zeros for positions, False for mask
         traj = np.zeros((future_steps, 2), dtype=np.float32)
         mask = np.zeros(future_steps, dtype=bool)
 
-        # Get this vehicle's future rows sorted by time
         vehicle_future = gt_df[
             (gt_df['track_uuid'] == track_id) &
             (gt_df['timestamp_ns'] > current_ts_ns)
-        ].sort_values('timestamp_ns')
+        ].sort_values('timestamp_ns').iloc[:future_steps]
 
         if vehicle_future.empty:
-            # No future observations — return all zeros, all False
             return traj, mask
 
-        # Take only the next future_steps rows
-        vehicle_future = vehicle_future.iloc[:future_steps]
-        num_valid = len(vehicle_future)
+        ego_pose_lookup = ego_poses_df.set_index('timestamp_ns')
 
-        # Extract world-frame (x, y) positions
-        # SOURCED: tx_m, ty_m are city-frame positions in
-        # annotations_with_intent.feather after city-frame GT fix
-        world_xy = vehicle_future[['tx_m', 'ty_m']].values  # [T, 2]
+        valid_count = 0
+        for i, (_, row) in enumerate(vehicle_future.iterrows()):
+            ts = row['timestamp_ns']
 
-        # Add z=0 to make 3D for transform_points()
-        # ASSUMED: flat ground plane — z discarded immediately after
-        world_xyz = np.hstack([
-            world_xy,
-            np.zeros((num_valid, 1), dtype=np.float32)
-        ])  # [T, 3]
+            # Get ego pose at this future timestamp
+            if ts not in ego_pose_lookup.index:
+                continue
 
-        # Transform from world frame to ego frame
-        # ego_SE3_world = inverse of world_SE3_ego
-        # result: positions relative to ego vehicle at current timestamp
-        ego_xyz = transform_points(world_xyz, ego_SE3_world)  # [T, 3]
-        ego_xy = ego_xyz[:, :2]  # [T, 2] — drop z
+            future_ego_row = ego_pose_lookup.loc[ts]
+            f_tx = float(future_ego_row['tx_m'])
+            f_ty = float(future_ego_row['ty_m'])
+            f_tz = float(future_ego_row.get('tz_m', 0.0))
+            f_q = np.array([
+                float(future_ego_row['qx']),
+                float(future_ego_row['qy']),
+                float(future_ego_row['qz']),
+                float(future_ego_row['qw'])
+            ])
 
-        # Fill output arrays
-        traj[:num_valid] = ego_xy
-        mask[:num_valid] = True
+            # Build world_SE3_future_ego
+            world_SE3_future_ego = np.eye(4)
+            world_SE3_future_ego[:3, :3] = R.from_quat(f_q).as_matrix()
+            world_SE3_future_ego[:3, 3] = [f_tx, f_ty, f_tz]
+
+            # Agent position in future ego frame
+            agent_future_ego = np.array([[
+                float(row['tx_m']),
+                float(row['ty_m']),
+                0.0
+            ]])
+
+            # Step 1: future ego frame → world frame
+            agent_world = transform_points(agent_future_ego, world_SE3_future_ego)
+
+            # Step 2: world frame → current ego frame
+            agent_current_ego = transform_points(agent_world, ego_SE3_world)
+
+            traj[i] = agent_current_ego[0, :2]
+            mask[i] = True
+            valid_count += 1
 
         return traj, mask
 
@@ -741,6 +713,7 @@ class ArgoverseIntentNetDataset(Dataset):
                         track_id=track_id,
                         current_ts_ns=current_ts_ns,
                         gt_df=gt_df_with_intent,
+                        ego_poses_df=ego_poses_df,
                         ego_SE3_world=ego_SE3_world,
                         future_steps=TRAJECTORY_FUTURE_STEPS
                     )
