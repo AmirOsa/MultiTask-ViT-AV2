@@ -126,8 +126,8 @@ eval:
 # Checkpoints
 # ─────────────────────────────────────────────
 checkpoints:
-  save_dir: "/content/drive/MyDrive/Amir_Dataset/IntentTrajNet_checkpoints"
-  filename: "intenttrajnet_v2.pth"
+  save_dir: "/content/drive/MyDrive/Bachelor Thesis/Checkpoints"
+  filename: "MultiTask_V2.pth"
   pretrained_v1: ""
   # Optional: path to V1 checkpoint to initialise backbone weights
   # Leaving empty → backbone trains from scratch (same as V1)
