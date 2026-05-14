@@ -50,8 +50,8 @@ model:
 # Data
 # ─────────────────────────────────────────────
 data:
-  train_dir: "/content/drive/MyDrive/Bachelor Thesis/MultiTask_V2/av2/sensor/val"
-  val_dir:   "/content/drive/MyDrive/Bachelor Thesis/MultiTask_V2/av2/sensor/val"
+  train_dir: "/content/local_data/val"
+  val_dir:   "/content/local_data/val"
   future_traj: true
   # True → dataset loads future_traj_ego [N,60,2] and future_traj_mask [N,60]
   # from annotations_with_intent.feather (precomputed city-frame GT)
