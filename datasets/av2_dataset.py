@@ -713,7 +713,6 @@ class ArgoverseIntentNetDataset(Dataset):
                 current_ts_ns,
                 gt_df_with_intent,
                 map_api,
-                ego_SE3_world=ego_SE3_world
             )
 
             # =================================================================
@@ -742,7 +741,6 @@ class ArgoverseIntentNetDataset(Dataset):
                         track_id=track_id,
                         current_ts_ns=current_ts_ns,
                         gt_df=gt_df_with_intent,
-                        ego_SE3_world=ego_SE3_world,
                         future_steps=TRAJECTORY_FUTURE_STEPS
                     )
                     future_trajs_np[i] = traj
