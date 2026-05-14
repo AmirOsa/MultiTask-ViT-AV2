@@ -50,7 +50,7 @@ model:
 # Data
 # ─────────────────────────────────────────────
 data:
-  train_dir: "/content/local_data/val"
+  train_dir: "/content/local_data/train"
   val_dir:   "/content/local_data/val"
   future_traj: true
   # True → dataset loads future_traj_ego [N,60,2] and future_traj_mask [N,60]
