@@ -339,12 +339,28 @@ if __name__ == '__main__':
     ).to(DEVICE)
     print(f"Anchors: {anchors.shape}\n")
 
+    # ========================================================================= 
+    # Resume from checkpoint if specified                                              #remove this block after finishing training
+    # =========================================================================
+    RESUME_CHECKPOINT = get_nested(cfg, 'checkpoints', 'resume', default='')
+    start_epoch = 0
+
+    if RESUME_CHECKPOINT and Path(RESUME_CHECKPOINT).is_file():
+        print(f"Resuming from checkpoint: {RESUME_CHECKPOINT}")
+        ckpt = torch.load(RESUME_CHECKPOINT, map_location=DEVICE, weights_only=False)
+        model.load_state_dict(ckpt['model_state_dict'])
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        start_epoch = ckpt['epoch']
+        print(f"Resuming from epoch {start_epoch + 1}\n")
+    else:
+        print("Starting from scratch.\n")
+
     # =========================================================================
     # Training loop
     # =========================================================================
     print(f"--- Starting Training [{MODEL_VERSION}] ---\n")
 
-    for epoch in range(NUM_EPOCHS):
+    for epoch in range(start_epoch, NUM_EPOCHS):                                 #remove (start_epoch,) after finishing training
         model.train()
 
         epoch_loss = 0.0
