@@ -467,6 +467,24 @@ if __name__ == '__main__':
             print(summary)
 
             scheduler.step(avg_loss)
+
+            # ── NEW: save checkpoint after every epoch ──────────────────
+            save_dir = Path(MODEL_SAVE_DIR)
+            save_dir.mkdir(parents=True, exist_ok=True)
+            epoch_save_path = save_dir / f"MultiTask_V2_epoch{epoch+1}.pth"
+            torch.save({
+                'epoch': epoch + 1,
+                'model_version': MODEL_VERSION,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'backbone_cfg': BACKBONE_CFG,
+                'use_trajectory': USE_TRAJECTORY,
+                'traj_lambda': TRAJ_LAMBDA,
+                'config_path': str(config_path),
+            }, epoch_save_path)
+            print(f"Checkpoint saved: {epoch_save_path}")
+            # ────────────────────────────────────────────────────────────
+
         else:
             print(f"Epoch {epoch+1}: No batches processed.")
 
