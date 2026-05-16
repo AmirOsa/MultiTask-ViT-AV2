@@ -125,7 +125,7 @@ eval:
 checkpoints:
   save_dir: "/content/drive/MyDrive/Bachelor Thesis/Checkpoints"
   filename: "MultiTask_V2.pth"
-  resume: "/content/drive/MyDrive/Bachelor Thesis/Checkpoints/MultiTask_V2_epoch2.pth"   #remove after finishing training
+  resume: "/content/drive/MyDrive/Bachelor Thesis/Checkpoints/MultiTask_V2_epoch8.pth"   #remove after finishing training
   pretrained_v1: ""
   # Optional: path to V1 checkpoint to initialise backbone weights
   # Leaving empty → backbone trains from scratch (same as V1)
