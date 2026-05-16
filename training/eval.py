@@ -13,6 +13,9 @@
 #   5. Extracted metrics to utils/metrics.py
 #   6. All original detection and intention eval logic unchanged
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -316,13 +319,23 @@ def main_eval():
                     if gt_b0 is not None and 'future_traj_ego' in gt_b0:
                         gt_traj = gt_b0['future_traj_ego'].to(DEVICE)
                         gt_mask = gt_b0['future_traj_mask'].to(DEVICE)
-                        traj_m = compute_trajectory_metrics(
-                            y_hat=y_hat,
-                            pi=pi,
-                            gt_traj=gt_traj,
-                            gt_mask=gt_mask,
-                        )
-                        all_traj_metric_results.append(traj_m)
+
+                        # Align N between trajectory prediction and GT
+                        # y_hat: [F, N_pred, 60, 4]
+                        # gt_traj: [N_gt, 60, 2]
+                        # N_pred and N_gt may differ due to filtering
+                        N_pred = y_hat.shape[1]
+                        N_gt   = gt_traj.shape[0]
+                        N_eval = min(N_pred, N_gt)
+
+                        if N_eval > 0:
+                            traj_m = compute_trajectory_metrics(
+                                y_hat=y_hat[:, :N_eval],
+                                pi=pi[:N_eval] if pi is not None else None,
+                                gt_traj=gt_traj[:N_eval],
+                                gt_mask=gt_mask[:N_eval],
+                            )
+                            all_traj_metric_results.append(traj_m)
 
             except Exception as e:
                 print(f"ERROR in eval batch: {e}")
