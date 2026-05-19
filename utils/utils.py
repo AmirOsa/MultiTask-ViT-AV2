@@ -290,22 +290,82 @@ def decode_box_predictions(box_preds_rel: torch.Tensor, anchors_xywha: torch.Ten
 
     return torch.stack([pred_cx, pred_cy, pred_w, pred_l, pred_heading_rad], dim=-1)
 
-def apply_nms(boxes_xywha: torch.Tensor, scores: torch.Tensor, iou_threshold: float = 0.2) -> torch.Tensor:
+def apply_nms(
+    boxes_xywha: torch.Tensor,
+    scores: torch.Tensor,
+    iou_threshold: float = 0.2,
+    use_rotated: bool = False,
+) -> torch.Tensor:
     """
-    Applies Non-Maximum Suppression (NMS) using torchvision.
-    Converts xywha boxes to approximate x1y1x2y2 for axis-aligned NMS.
+    Applies Non-Maximum Suppression (NMS).
+
+    Two modes controlled by use_rotated:
+      False (default): axis-aligned NMS using torchvision.ops.nms
+                       fast, approximate, ignores heading angle
+      True:            rotated NMS using compute_rotated_iou (Shapely)
+                       accurate for oriented vehicles, slower
+                       SOURCED: Nadeem thesis Section 5.2.3
+
+    Args:
+        boxes_xywha:   [N, 5] boxes (cx, cy, w, l, heading)
+        scores:        [N] confidence scores
+        iou_threshold: IoU threshold for suppression
+        use_rotated:   whether to use rotated IoU for NMS
+
+    Returns:
+        keep: [K] indices of surviving boxes
     """
     if boxes_xywha.shape[0] == 0:
         return torch.empty((0,), dtype=torch.long, device=boxes_xywha.device)
 
-    cx, cy, w, l = boxes_xywha[:, 0], boxes_xywha[:, 1], boxes_xywha[:, 2], boxes_xywha[:, 3]
-    x1 = cx - w / 2
-    y1 = cy - l / 2 
-    x2 = cx + w / 2
-    y2 = cy + l / 2
-    boxes_corners_x1y1x2y2 = torch.stack([x1, y1, x2, y2], dim=1)
+    if use_rotated and SHAPELY_AVAILABLE:
+        # Rotated NMS using Shapely polygons
+        # SOURCED: Nadeem thesis Section 5.2.3
+        # More accurate for oriented vehicles at intersections
+        sort_idx    = torch.argsort(scores, descending=True)
+        keep        = []
+        suppressed  = torch.zeros(boxes_xywha.shape[0], dtype=torch.bool,
+                                  device=boxes_xywha.device)
 
-    return torchvision.ops.nms(boxes_corners_x1y1x2y2, scores, iou_threshold)
+        for i in range(len(sort_idx)):
+            idx = sort_idx[i].item()
+            if suppressed[idx]:
+                continue
+            keep.append(idx)
+
+            if i == len(sort_idx) - 1:
+                break
+
+            # Compute rotated IoU between this box and all remaining
+            remaining_mask = ~suppressed
+            remaining_mask[idx] = False
+            remaining_idx = torch.where(remaining_mask)[0]
+
+            if remaining_idx.numel() == 0:
+                break
+
+            iou_row = compute_rotated_iou(
+                boxes_xywha[idx].unsqueeze(0),
+                boxes_xywha[remaining_idx]
+            ).squeeze(0)  # [num_remaining]
+
+            suppress_mask = iou_row >= iou_threshold
+            suppressed[remaining_idx[suppress_mask]] = True
+
+        if not keep:
+            return torch.empty((0,), dtype=torch.long, device=boxes_xywha.device)
+        return torch.tensor(keep, dtype=torch.long, device=boxes_xywha.device)
+
+    else:
+        # Axis-aligned NMS using torchvision (fast, original behaviour)
+        cx, cy, w, l = (boxes_xywha[:, 0], boxes_xywha[:, 1],
+                        boxes_xywha[:, 2], boxes_xywha[:, 3])
+        x1 = cx - w / 2
+        y1 = cy - l / 2
+        x2 = cx + w / 2
+        y2 = cy + l / 2
+        boxes_x1y1x2y2 = torch.stack([x1, y1, x2, y2], dim=1)
+        return torchvision.ops.nms(boxes_x1y1x2y2, scores, iou_threshold)
 
 def compute_axis_aligned_iou(boxes1_xywh: torch.Tensor, boxes2_xywh: torch.Tensor) -> torch.Tensor:
     """Computes axis-aligned IoU between two sets of boxes (cx, cy, w, h)."""

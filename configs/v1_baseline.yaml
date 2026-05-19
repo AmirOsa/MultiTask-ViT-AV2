@@ -87,6 +87,8 @@ eval:
   confidence_threshold: 0.1
   nms_iou_threshold: 0.2
   use_rotated_iou: false
+  use_rotated_nms: false        # NEW — NOT YET DECIDED 4
+  use_agent_local_traj: false   # NEW — V1 has no trajectory, irrelevant but needed
   batch_size: 8
 
 # ─────────────────────────────────────────────
