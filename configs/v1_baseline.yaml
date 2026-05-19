@@ -34,8 +34,8 @@ model:
 # Data
 # ─────────────────────────────────────────────
 data:
-  train_dir: "/content/drive/MyDrive/Amir_Dataset/ViT-project/av2/sensor/train"
-  val_dir:   "/content/drive/MyDrive/Amir_Dataset/ViT-project/av2/sensor/val"
+  train_dir: "/content/local_data/train"
+  val_dir:   "/content/local_data/val"
   future_traj: false
   # False → dataset does not load future_traj_ego or future_traj_mask
   # Saves memory and preprocessing time for V1
@@ -93,5 +93,5 @@ eval:
 # Checkpoints
 # ─────────────────────────────────────────────
 checkpoints:
-  save_dir: "/content/drive/MyDrive/Amir_Dataset/IntentTrajNet_checkpoints"
-  filename: "intenttrajnet_v1.pth"
+  save_dir: "/content/drive/MyDrive/Bachelor Thesis/Checkpoints"
+  filename: "MultiTask_V1.pth"

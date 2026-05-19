@@ -487,7 +487,7 @@ if __name__ == '__main__':
             # ── NEW: save checkpoint after every epoch ──────────────────
             save_dir = Path(MODEL_SAVE_DIR)
             save_dir.mkdir(parents=True, exist_ok=True)
-            epoch_save_path = save_dir / f"MultiTask_V2_epoch{epoch+1}.pth"
+            epoch_save_path = save_dir / f"MultiTask_V1_epoch{epoch+1}.pth"
             torch.save({
                 'epoch': epoch + 1,
                 'model_version': MODEL_VERSION,
