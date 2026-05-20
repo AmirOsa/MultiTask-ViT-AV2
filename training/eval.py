@@ -529,56 +529,79 @@ def main_eval():
                         if N_eval > 0:
                             boxes_ok = (gt_boxes.shape[0] >= N_eval)
 
-                            if EVAL_USE_AGENT_LOCAL_TRAJ and boxes_ok:
-                                # ─────────────────────────────────────────────
+                            # ─────────────────────────────────────────────
+                            # [NEW] Filter to vehicles inside BEV range
+                            # Vehicles outside BEV cannot be seen by model
+                            # Including them inflates minADE artificially
+                            # BEV covers: x=-40m to +80m, y=-72m to +72m
+                            # SOURCED: constants.py BEV_X_MIN/MAX, BEV_Y_MIN/MAX
+                            # ─────────────────────────────────────────────
+                            BEV_X_MIN, BEV_X_MAX = -40.0, 80.0
+                            BEV_Y_MIN, BEV_Y_MAX = -72.0, 72.0
+
+                            gt_boxes_eval = gt_boxes[:N_eval]
+                            in_bev_mask = (
+                                (gt_boxes_eval[:, 0] >= BEV_X_MIN) &
+                                (gt_boxes_eval[:, 0] <= BEV_X_MAX) &
+                                (gt_boxes_eval[:, 1] >= BEV_Y_MIN) &
+                                (gt_boxes_eval[:, 1] <= BEV_Y_MAX)
+                            )
+                            in_bev_idx = torch.where(in_bev_mask)[0]
+                            N_in_bev = len(in_bev_idx)
+
+                            if N_in_bev == 0:
+                                # no in-BEV vehicles this batch
+                                pass
+                            elif EVAL_USE_AGENT_LOCAL_TRAJ and boxes_ok:
+                                # ─────────────────────────────────────────
                                 # [NEW] Transform to agent-local frame
                                 # SOURCED: Abdulbaki thesis Section 3.6
-                                # ─────────────────────────────────────────────
+                                # ─────────────────────────────────────────
 
-                                # Transform GT trajectory: [N, 60, 2]
+                                gt_traj_inbev  = gt_traj[:N_eval][in_bev_idx]
+                                gt_mask_inbev  = gt_mask[:N_eval][in_bev_idx]
+                                gt_boxes_inbev = gt_boxes_eval[in_bev_idx]
+
                                 gt_traj_local = transform_to_agent_local(
-                                    gt_traj[:N_eval],
-                                    gt_boxes[:N_eval]
+                                    gt_traj_inbev,
+                                    gt_boxes_inbev
                                 )
 
-                                # Transform predictions per mode
-                                # y_hat: [F, N, 60, 4]
                                 F = y_hat.shape[0]
                                 pred_local_modes = []
                                 for f in range(F):
                                     local_f = transform_to_agent_local(
-                                        y_hat[f, :N_eval, :, :2],
-                                        gt_boxes[:N_eval]
+                                        y_hat[f, in_bev_idx, :, :2],
+                                        gt_boxes_inbev
                                     )
                                     pred_local_modes.append(local_f)
 
                                 pred_pos_local = torch.stack(
                                     pred_local_modes, dim=0
-                                )  # [F, N, 60, 2]
+                                )  # [F, N_in_bev, 60, 2]
 
-                                # Rebuild y_hat with local positions
-                                # scale (bx, by) unchanged — only positions
-                                y_hat_local = y_hat[:, :N_eval].clone()
+                                y_hat_local = y_hat[:, in_bev_idx].clone()
                                 y_hat_local[..., :2] = pred_pos_local
 
                                 traj_m = compute_trajectory_metrics(
                                     y_hat=y_hat_local,
-                                    pi=(pi[:N_eval]
+                                    pi=(pi[in_bev_idx]
                                         if pi is not None else None),
                                     gt_traj=gt_traj_local,
-                                    gt_mask=gt_mask[:N_eval],
+                                    gt_mask=gt_mask_inbev,
                                 )
-                            else:
-                                # Original ego-frame evaluation (fallback)
-                                traj_m = compute_trajectory_metrics(
-                                    y_hat=y_hat[:, :N_eval],
-                                    pi=(pi[:N_eval]
-                                        if pi is not None else None),
-                                    gt_traj=gt_traj[:N_eval],
-                                    gt_mask=gt_mask[:N_eval],
-                                )
+                                all_traj_metric_results.append(traj_m)
 
-                            all_traj_metric_results.append(traj_m)
+                            else:
+                                # Ego-frame fallback — also filter to in-BEV
+                                traj_m = compute_trajectory_metrics(
+                                    y_hat=y_hat[:, in_bev_idx],
+                                    pi=(pi[in_bev_idx]
+                                        if pi is not None else None),
+                                    gt_traj=gt_traj[:N_eval][in_bev_idx],
+                                    gt_mask=gt_mask[:N_eval][in_bev_idx],
+                                )
+                                all_traj_metric_results.append(traj_m)
 
             except Exception as e:
                 print(f"ERROR in eval batch: {e}")
