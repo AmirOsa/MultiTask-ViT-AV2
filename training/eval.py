@@ -39,6 +39,8 @@ from utils.constants import (
     TRAJECTORY_NUM_MODES,
     INTENTIONS_MAP_REV,
     NUM_INTENTION_CLASSES,
+    BEV_X_MIN, BEV_X_MAX,  
+    BEV_Y_MIN, BEV_Y_MAX,
 )
 from datasets.av2_dataset import ArgoverseIntentNetDataset, collate_fn
 from models.model_mt import IntentNetViT_MT
@@ -533,11 +535,11 @@ def main_eval():
                             # [NEW] Filter to vehicles inside BEV range
                             # Vehicles outside BEV cannot be seen by model
                             # Including them inflates minADE artificially
-                            # BEV covers: x=-40m to +80m, y=-72m to +72m
+                            # BEV covers: x=-20m to +60m, y=-72m to +72m
                             # SOURCED: constants.py BEV_X_MIN/MAX, BEV_Y_MIN/MAX
                             # ─────────────────────────────────────────────
-                            BEV_X_MIN, BEV_X_MAX = -40.0, 80.0
-                            BEV_Y_MIN, BEV_Y_MAX = -72.0, 72.0
+                            #BEV_X_MIN, BEV_X_MAX = -20.0, 60.0
+                            #BEV_Y_MIN, BEV_Y_MAX = -72.0, 72.0
 
                             gt_boxes_eval = gt_boxes[:N_eval]
                             in_bev_mask = (
