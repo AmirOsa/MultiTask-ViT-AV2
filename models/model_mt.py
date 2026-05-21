@@ -91,6 +91,9 @@ class IntentNetViT_MT(nn.Module):
         if backbone_cfg is None:
             backbone_cfg = {}
 
+        # Remove 'type' key — used for routing only, not passed to constructors
+        backbone_cfg.pop('type', None)    
+
         # =====================================================================
         # Backbone — selected by backbone_type
         # =====================================================================
