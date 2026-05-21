@@ -265,6 +265,7 @@ if __name__ == '__main__':
     # =========================================================================
     print("Initializing model...")
     model = IntentNetViT_MT(
+        backbone_type=backbone_type,
         backbone_cfg=BACKBONE_CFG,
         use_trajectory=USE_TRAJECTORY,
     ).to(DEVICE)
