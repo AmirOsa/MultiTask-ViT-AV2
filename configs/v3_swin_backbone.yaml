@@ -1,0 +1,146 @@
+# configs/v3_swin_backbone.yaml
+#
+# IntentTrajNet-AV2 — V3 Configuration
+# Change vs V2: backbone only — ViT scratch → Swin-T pretrained ImageNet
+# Everything else identical to V2 (MLP decoder, same loss, same λ=0.1)
+#
+# Research question:
+#   Does a pretrained hierarchical backbone improve detection and
+#   intention accuracy over V2's ViT trained from scratch?
+#   (trajectory decoder unchanged — isolates backbone contribution)
+#
+# SOURCED: Swin Transformer — Liu et al., ICCV 2021 Best Paper
+# SOURCED: ImageNet pretrained ViT transfers to LiDAR — RangeViT, CVPR 2023
+
+# ─────────────────────────────────────────────
+# Model
+# ─────────────────────────────────────────────
+model:
+  version: "V3"
+  use_trajectory: true
+  # True → same MLP TrajectoryHead as V2
+  # Backbone swap is the ONLY change vs V2
+
+  backbone:
+    type: "swin"
+    # SOURCED: Swin Transformer — Liu et al., ICCV 2021 Best Paper
+    # "Swin Transformer: Hierarchical Vision Transformer using Shifted Windows"
+    swin_model_name: "swin_tiny_patch4_window7_224"
+    # Swin-Tiny: lightest Swin variant, good balance of performance and compute
+    # Chosen over Swin-S (1.5× more params) and Video Swin (4× more compute)
+    pretrained: true
+    # True → ImageNet pretrained weights loaded via timm
+    # SOURCED: RangeViT (CVPR 2023) — pretrained ViTs transfer to LiDAR data
+    # despite domain gap via mean-and-repeat channel initialisation
+    window_size: 5
+    # NEEDS TEST: must divide feature map dimensions evenly
+    # feature map = img_size / patch_size = 400/4=100, 720/4=180
+    # window_size=5: 100/5=20 ✓, 180/5=36 ✓
+    # window_size=4: 100/4=25 ✓, 180/4=45 ✓ (fallback if 5 fails)
+    out_channels: 512
+    # Must match V1/V2 feature channels so all heads work unchanged
+    # SOURCED: 512 from Nadeem thesis Section 3.3
+
+  trajectory:
+    decoder_type: "mlp"
+    # UNCHANGED from V2 — MLP decoder kept to isolate backbone contribution
+    # V4 will upgrade this to transformer
+    future_steps: 60
+    # SOURCED: Abdulbaki thesis Section 3.1 — 6 seconds × 10Hz
+    num_modes: 6
+    # SOURCED: Abdulbaki thesis Section 3.4.3
+    hidden_size: 256
+    # Confirmed by V2 ablation — best of {128, 256, 512}
+    min_scale: 0.001
+    # SOURCED: HiVT decoder.py
+
+# ─────────────────────────────────────────────
+# Data
+# ─────────────────────────────────────────────
+data:
+  train_dir: "/content/local_data/train"
+  val_dir:   "/content/local_data/val"
+  future_traj: true
+  # True → dataset loads future_traj_ego [N,60,2] and future_traj_mask [N,60]
+  # Identical to V2 — trajectory GT still needed for MLP decoder
+  gt_frame: "ego"
+  # Trajectory GT in ego frame — same as V2
+
+# ─────────────────────────────────────────────
+# Training
+# ─────────────────────────────────────────────
+training:
+  batch_size: 8
+  num_epochs: 10
+  num_workers: 0
+
+  optimizer:
+    type: "AdamW"
+    lr_backbone: 0.00001
+    # Lower LR for pretrained Swin backbone (10× lower than heads)
+    # SOURCED: standard practice — pretrained layers use lower LR to
+    # avoid destroying ImageNet features before heads have learned.
+    # Howard & Ruder (ACL 2018) — discriminative fine-tuning.
+    lr_heads: 0.0001
+    # Standard LR for detection, intention, trajectory heads
+    # SOURCED: Nadeem thesis Section 3.4 — 1e-4 for new layers
+    weight_decay: 0.0001
+
+  scheduler:
+    type: "ReduceLROnPlateau"
+    mode: "min"
+    factor: 0.1
+    patience: 3
+    # SOURCED: Nadeem thesis Section 3.4 — same scheduler as V1/V2
+
+# ─────────────────────────────────────────────
+# Loss
+# ─────────────────────────────────────────────
+loss:
+  use_rotated_iou: false
+  apply_intention_downsampling: true
+  intention_downsample_ratio: 0.85
+  # SOURCED: Nadeem thesis Section 3.4 — unchanged from V1/V2
+
+  iou_threshold: 0.6
+  neg_iou_threshold: 0.45
+  box_weight: 1.0
+  cls_weight: 1.0
+  intent_weight: 0.5
+  # SOURCED: Nadeem thesis Section 3.4 — unchanged from V1/V2
+
+  traj_lambda: 0.1
+  # UNCHANGED from V2 — confirmed by ablation
+  # Not re-ablated for V3 to save compute and maintain fair comparison
+
+# ─────────────────────────────────────────────
+# Evaluation
+# ─────────────────────────────────────────────
+eval:
+  confidence_threshold: 0.1
+  nms_iou_threshold: 0.2
+  use_rotated_iou: false
+  use_rotated_nms: false
+  # UNCHANGED from V1/V2 — axis-aligned NMS for fair comparison
+  use_agent_local_traj: true
+  # Transform trajectory to agent-local frame for metrics
+  # SOURCED: Abdulbaki thesis Section 3.6
+  batch_size: 8
+
+  trajectory_metrics:
+    miss_rate_threshold_m: 2.0
+    # SOURCED: Abdulbaki thesis Section 3.7
+
+# ─────────────────────────────────────────────
+# Checkpoints
+# ─────────────────────────────────────────────
+checkpoints:
+  save_dir: "/content/drive/MyDrive/Bachelor Thesis/Checkpoints"
+  filename: "MultiTask_V3.pth"
+  resume: ""
+  # Fill in path to resume from a specific epoch checkpoint
+  pretrained_v2: ""
+  # Optional: initialise backbone from V2 checkpoint before fine-tuning
+  # Leaving empty → Swin loads ImageNet pretrained weights via timm
+  # Filling this → backbone starts from V2 weights (not recommended —
+  # V2 backbone is ViT, not Swin; weights are incompatible)

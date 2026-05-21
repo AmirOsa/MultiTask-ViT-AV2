@@ -1,31 +1,35 @@
 # models/model_mt.py
 #
 # New file for IntentTrajNet-AV2
-# Author: [Your Name] — Bachelor Thesis, GUC 2025
+# Author: Amir — Bachelor Thesis, GUC 2025
 #
-# This file assembles the full multi-task model by combining:
-#   - TwoStreamViTBackbone from Nadeem's model_vit.py (imported, not copied)
-#   - DetectionHead and IntentionHead from models/heads.py (unchanged from Nadeem)
-#   - TrajectoryHead from models/heads.py (new)
+# Assembles the full multi-task model by combining backbone + heads.
+# Supports all five model versions through config:
 #
-# Design principle:
-#   TwoStreamViTBackbone is imported directly from the original repo
-#   rather than copied. This means any fixes to the backbone automatically
-#   apply here. The backbone is treated as a black box — input is
-#   (lidar_bev, map_bev), output is [B, 512, 50, 90] feature map.
+#   V1: backbone='vit', use_trajectory=False
+#       Detection + intention only. Identical to Nadeem's IntentNetViT.
 #
-# V1 mode (use_trajectory=False):
-#   Identical to Nadeem's IntentNetViT — only detection and intention heads.
-#   Used as the baseline for comparison.
+#   V2: backbone='vit', use_trajectory=True
+#       Adds MLP trajectory decoder on top of same ViT backbone.
 #
-# V2 mode (use_trajectory=True, backbone='vit'):
-#   Adds TrajectoryHead on top of the same ViT backbone.
-#   Trajectory predictions from 1-second implicit BEV history.
+#   V3: backbone='swin', use_trajectory=True
+#       Swaps backbone to Swin-T pretrained. MLP decoder unchanged.
+#       ONLY change vs V2 — isolates backbone contribution.
 #
-# V3 mode (use_trajectory=True, backbone='swin'):
-#   Swaps backbone to Swin-T (pretrained).
-#   Trajectory decoder upgraded to transformer (cross-attention over BEV).
-#   Added in backbone.py — referenced here via config.
+#   V4: backbone='swin', use_trajectory=True, decoder_type='transformer'
+#       Adds transformer trajectory decoder + agent history.
+#       (decoder_type handled in trajectory_decoder.py — not yet implemented)
+#
+#   V5: backbone='swin', use_trajectory=True, decoder_type='transformer'
+#       Adds class weights + 6s horizon + velocity heading.
+#       (supervision changes in loss.py and dataset.py)
+#
+# Backbone selection:
+#   'vit'  → TwoStreamViTBackbone (Nadeem's original, trained from scratch)
+#   'swin' → SwinBackbone (Swin-T pretrained ImageNet, new for V3+)
+#
+# All heads (DetectionHead, IntentionHead, TrajectoryHead) are backbone-agnostic.
+# Both backbones output [B, 512, 50, 90] — heads work unchanged for all versions.
 
 import torch
 import torch.nn as nn
@@ -33,14 +37,8 @@ import torch.nn.functional as F
 import numpy as np
 from pathlib import Path
 
-# Import backbone from Nadeem's original — no code duplication
-# Importing from our backbone.py
 from models.backbone import TwoStreamViTBackbone, SwinBackbone
-
-# Import heads from our new heads.py
 from models.heads import DetectionHead, IntentionHead, TrajectoryHead
-
-# Import constants
 from utils.constants import (
     LIDAR_TOTAL_CHANNELS,
     MAP_CHANNELS,
@@ -48,8 +46,8 @@ from utils.constants import (
     GRID_WIDTH_PX,
     NUM_ANCHORS_PER_LOC,
     NUM_INTENTION_CLASSES,
-    TRAJECTORY_FUTURE_STEPS,   # SOURCED: Abdulbaki thesis Section 3.1
-    TRAJECTORY_NUM_MODES,      # SOURCED: Abdulbaki thesis Section 3.4.3
+    TRAJECTORY_FUTURE_STEPS,
+    TRAJECTORY_NUM_MODES,
     VOXEL_SIZE_M,
     BEV_PIXEL_OFFSET_X,
     BEV_PIXEL_OFFSET_Y,
@@ -59,92 +57,135 @@ from utils.utils import generate_anchors
 
 class IntentNetViT_MT(nn.Module):
     """
-    Multi-task Vision Transformer model for joint vehicle detection,
-    intention prediction, and trajectory forecasting from LiDAR BEV.
+    Multi-task model for joint vehicle detection, intention prediction,
+    and trajectory forecasting from LiDAR BEV.
 
-    Extends Nadeem's IntentNetViT by adding a trajectory prediction head
-    on top of the shared backbone feature map.
+    Supports V1 through V5 via backbone_type and use_trajectory flags.
+    All versions share the same heads — only the backbone changes between
+    V1/V2 (ViT) and V3/V4/V5 (Swin-T pretrained).
 
-    Three operating modes controlled by config:
-        V1: use_trajectory=False — detection + intention only (baseline)
-        V2: use_trajectory=True, backbone='vit' — + MLP trajectory decoder
-        V3: use_trajectory=True, backbone='swin' — + transformer decoder
-            (backbone swap handled in backbone.py, referenced via config)
+    Output feature map is always [B, 512, 50, 90] regardless of backbone,
+    so DetectionHead, IntentionHead, and TrajectoryHead are unchanged.
 
-    Architecture:
-        Input:  lidar_bev [B, 290, 400, 720]
-                map_bev   [B,   9, 400, 720]
-                    ↓
-        TwoStreamViTBackbone
-                    ↓
-        feature_map [B, 512, 50, 90]   ← shared by all three heads
-                    ↓
-        ┌───────────┼───────────┐
-        ↓           ↓           ↓
-    DetHead    IntentHead   TrajHead (V2/V3 only)
-    [B,22500,1] [B,22500,8] [F,N,60,4] + [N,F]
-    [B,22500,6]
-
-    SOURCED: backbone architecture from Nadeem's thesis Section 3.3
-    SOURCED: detection and intention heads unchanged from Nadeem
-    SOURCED: trajectory head adapted from HiVT (Abdulbaki thesis Section 3.4.3)
+    Args:
+        backbone_type:      'vit' for V1/V2, 'swin' for V3/V4/V5
+        backbone_cfg:       dict of kwargs for the selected backbone class
+        use_trajectory:     False for V1, True for V2-V5
+        trajectory_head_cfg: optional kwargs for TrajectoryHead
     """
 
     def __init__(
         self,
-        # --- Backbone config ---
+        backbone_type: str = 'vit',
+        # 'vit'  → TwoStreamViTBackbone (V1, V2)
+        # 'swin' → SwinBackbone          (V3, V4, V5)
         backbone_cfg: dict | None = None,
-        # Dict of kwargs passed to TwoStreamViTBackbone.
-        # Same format as Nadeem's IntentNetViT for compatibility.
-        # SOURCED: parameter names from Nadeem's model_vit.py
-
-        # --- Trajectory head config ---
         use_trajectory: bool = True,
-        # False → V1 mode (no trajectory head)
-        # True  → V2/V3 mode (trajectory head active)
-
         trajectory_head_cfg: dict | None = None,
-        # Optional kwargs for TrajectoryHead
-        # Currently unused — TrajectoryHead reads from constants
-
     ) -> None:
         super().__init__()
 
         self.use_trajectory = use_trajectory
+        self.backbone_type = backbone_type
 
-        # =====================================================================
-        # Backbone — TwoStreamViTBackbone
-        # Imported from Nadeem's model_vit.py, not modified.
-        # SOURCED: Nadeem thesis Section 3.3
-        # =====================================================================
         if backbone_cfg is None:
             backbone_cfg = {}
 
-        # Apply same defaults as Nadeem's IntentNetViT
-        # SOURCED: default values from IntentNetViT.__init__ in model_vit.py
-        backbone_cfg.setdefault('vit_model_name_lidar', 'vit_small_patch8_224')
-        backbone_cfg.setdefault('vit_model_name_map', 'vit_small_patch8_224')
-        backbone_cfg.setdefault('pretrained_lidar', False)
-        backbone_cfg.setdefault('pretrained_map', False)
-        backbone_cfg.setdefault('img_size', (GRID_HEIGHT_PX, GRID_WIDTH_PX))
-        backbone_cfg.setdefault('lidar_adapter_out_channels', 192)
-        backbone_cfg.setdefault('map_adapter_out_channels', 192)
-        backbone_cfg.setdefault('fusion_block_planes', 512)
-        backbone_cfg.setdefault('fusion_block_layers', 2)
-        backbone_cfg.setdefault('fusion_block_kernel_size', 3)
-        backbone_cfg.setdefault('fusion_block_stride', 1)
+        # =====================================================================
+        # Backbone — selected by backbone_type
+        # =====================================================================
+        if backbone_type == 'swin':
+            # -----------------------------------------------------------------
+            # SwinBackbone — V3, V4, V5
+            # Swin-T pretrained on ImageNet
+            # SOURCED: Liu et al., ICCV 2021 Best Paper
+            # -----------------------------------------------------------------
+            swin_cfg = {
+                'lidar_input_channels': backbone_cfg.get(
+                    'lidar_input_channels', LIDAR_TOTAL_CHANNELS
+                ),
+                'map_input_channels': backbone_cfg.get(
+                    'map_input_channels', MAP_CHANNELS
+                ),
+                'pretrained': backbone_cfg.get('pretrained', True),
+                # True → ImageNet pretrained weights via timm
+                # SOURCED: RangeViT (CVPR 2023) — pretrained ViTs transfer
+                # to LiDAR despite domain gap
+                'out_channels': backbone_cfg.get('out_channels', 512),
+                # 512 to match TwoStreamViTBackbone output
+                # SOURCED: Nadeem thesis Section 3.3
+                'img_size': backbone_cfg.get(
+                    'img_size', (GRID_HEIGHT_PX, GRID_WIDTH_PX)
+                ),
+                'window_size': backbone_cfg.get('window_size', 5),
+                # NEEDS TEST: 5 divides 100 and 180 evenly
+                # (feature map = 400/4=100, 720/4=180 with patch_size=4)
+                'swin_model_name': backbone_cfg.get(
+                    'swin_model_name', 'swin_tiny_patch4_window7_224'
+                ),
+            }
+            self.backbone = SwinBackbone(**swin_cfg)
+            print(f"Backbone: SwinBackbone (pretrained={swin_cfg['pretrained']})")
 
-        self.backbone = TwoStreamViTBackbone(**backbone_cfg)
+        else:
+            # -----------------------------------------------------------------
+            # TwoStreamViTBackbone — V1, V2
+            # ViT trained from scratch — Nadeem's original
+            # SOURCED: Nadeem thesis Section 3.3
+            # -----------------------------------------------------------------
+            vit_cfg = {}
+            vit_cfg['vit_model_name_lidar'] = backbone_cfg.get(
+                'vit_model_name_lidar', 'vit_small_patch8_224'
+            )
+            vit_cfg['vit_model_name_map'] = backbone_cfg.get(
+                'vit_model_name_map', 'vit_small_patch8_224'
+            )
+            vit_cfg['pretrained_lidar'] = backbone_cfg.get(
+                'pretrained_lidar', False
+            )
+            vit_cfg['pretrained_map'] = backbone_cfg.get(
+                'pretrained_map', False
+            )
+            vit_cfg['img_size'] = backbone_cfg.get(
+                'img_size', (GRID_HEIGHT_PX, GRID_WIDTH_PX)
+            )
+            vit_cfg['lidar_adapter_out_channels'] = backbone_cfg.get(
+                'lidar_adapter_out_channels', 192
+            )
+            vit_cfg['map_adapter_out_channels'] = backbone_cfg.get(
+                'map_adapter_out_channels', 192
+            )
+            vit_cfg['fusion_block_planes'] = backbone_cfg.get(
+                'fusion_block_planes', 512
+            )
+            vit_cfg['fusion_block_layers'] = backbone_cfg.get(
+                'fusion_block_layers', 2
+            )
+            vit_cfg['fusion_block_kernel_size'] = backbone_cfg.get(
+                'fusion_block_kernel_size', 3
+            )
+            vit_cfg['fusion_block_stride'] = backbone_cfg.get(
+                'fusion_block_stride', 1
+            )
+            # Pass through any extra keys (e.g. res_block_type, drop_path_rate)
+            for k, v in backbone_cfg.items():
+                if k not in vit_cfg:
+                    vit_cfg[k] = v
+
+            self.backbone = TwoStreamViTBackbone(**vit_cfg)
+            print(
+                f"Backbone: TwoStreamViTBackbone "
+                f"({vit_cfg['vit_model_name_lidar']})"
+            )
+
+        # Both backbones output [B, 512, 50, 90]
         self.feature_channels = self.backbone.final_feature_channels
-        # SOURCED: 512 — Nadeem thesis Section 3.3
-
-        # Feature map spatial dimensions
-        # SOURCED: 50×90 = 400/8 × 720/8 — Nadeem thesis Section 3.3
-        self.feature_map_h = GRID_HEIGHT_PX // 8
-        self.feature_map_w = GRID_WIDTH_PX // 8
+        # Always 512 — heads are backbone-agnostic
+        self.feature_map_h = GRID_HEIGHT_PX // 8   # 50
+        self.feature_map_w = GRID_WIDTH_PX // 8    # 90
 
         # =====================================================================
-        # Detection Head — unchanged from Nadeem
+        # Detection Head — unchanged from Nadeem, all versions
         # SOURCED: Nadeem thesis Section 3.3
         # =====================================================================
         self.det_head = DetectionHead(
@@ -152,7 +193,7 @@ class IntentNetViT_MT(nn.Module):
         )
 
         # =====================================================================
-        # Intention Head — unchanged from Nadeem
+        # Intention Head — unchanged from Nadeem, all versions
         # SOURCED: Nadeem thesis Section 3.3
         # =====================================================================
         self.intention_head = IntentionHead(
@@ -160,9 +201,10 @@ class IntentNetViT_MT(nn.Module):
         )
 
         # =====================================================================
-        # Trajectory Head — NEW for V2 and V3
-        # Only created when use_trajectory=True
-        # SOURCED: adapted from HiVT MLPDecoder (Abdulbaki thesis Section 3.4.3)
+        # Trajectory Head — V2 onwards only
+        # V1: not created (use_trajectory=False)
+        # V2, V3: MLP decoder (BEVTrajectoryDecoder)
+        # V4, V5: transformer decoder (added in trajectory_decoder.py later)
         # =====================================================================
         if self.use_trajectory:
             if trajectory_head_cfg is None:
@@ -173,31 +215,32 @@ class IntentNetViT_MT(nn.Module):
                 feature_map_w=self.feature_map_w,
                 **trajectory_head_cfg
             )
-            print("TrajectoryHead: ENABLED (V2/V3 mode)")
+            print("TrajectoryHead: ENABLED")
         else:
             self.traj_head = None
             print("TrajectoryHead: DISABLED (V1 mode)")
 
         # =====================================================================
         # Pre-generate anchors
-        # SOURCED: generate_anchors() from utils.py — Nadeem's original
-        # Anchors are fixed during training, not learned parameters
+        # Fixed during training — not learned parameters
+        # SOURCED: generate_anchors() — Nadeem's original
         # =====================================================================
         anchors = generate_anchors()
         self.register_buffer('anchors', anchors)
-        # Registered as buffer so it moves to GPU with .to(device)
-        # and is saved with the model checkpoint
 
         print(
             f"\nIntentNetViT_MT Initialized:"
-            f"\n  Backbone: {backbone_cfg['vit_model_name_lidar']}"
+            f"\n  Version:          {backbone_type.upper()} backbone"
             f"\n  Feature channels: {self.feature_channels}"
-            f"\n  Feature map: {self.feature_map_h}×{self.feature_map_w}"
-            f"\n  Detection head: ENABLED"
-            f"\n  Intention head: ENABLED"
-            f"\n  Trajectory head: {'ENABLED' if use_trajectory else 'DISABLED'}"
-            f"\n  Anchors: {anchors.shape[0]} total"
+            f"\n  Feature map:      {self.feature_map_h}×{self.feature_map_w}"
+            f"\n  Trajectory head:  {'ENABLED' if use_trajectory else 'DISABLED'}"
+            f"\n  Anchors:          {anchors.shape[0]} total"
         )
+
+    # =========================================================================
+    # _boxes_to_feature_map_pixels
+    # Unchanged from original — coordinate conversion for trajectory head
+    # =========================================================================
 
     def _boxes_to_feature_map_pixels(
         self,
@@ -206,51 +249,44 @@ class IntentNetViT_MT(nn.Module):
         """
         Convert GT box centres from ego-frame metres to feature map pixel coords.
 
-        The BEV grid maps ego-frame metres to pixel coordinates using:
-            pixel_x = BEV_PIXEL_OFFSET_X + y_ego / VOXEL_SIZE_M
-            pixel_y = BEV_PIXEL_OFFSET_Y - x_ego / VOXEL_SIZE_M
+        BEV coordinate convention (from Nadeem's utils.py):
+            pixel_x (col) = BEV_PIXEL_OFFSET_X + y_ego / VOXEL_SIZE_M
+            pixel_y (row) = BEV_PIXEL_OFFSET_Y - x_ego / VOXEL_SIZE_M
 
-        The feature map is 8× smaller than the BEV image (stride=8).
-        So feature map pixel = BEV pixel / 8.
+        Feature map is 8× smaller than BEV image (stride=8 for both ViT and Swin
+        since SwinBackbone upsamples to [B, 512, 50, 90] matching ViT output).
 
-        SOURCED: coordinate mapping from utils.py create_intentnet_lidar_bev()
-        and world_to_bev_pixel() — Nadeem's original coordinate convention.
+        SOURCED: coordinate mapping from utils.py — Nadeem's original convention.
 
         Args:
-            boxes_xywha: [N, 5] GT boxes in ego frame (cx_m, cy_m, w, l, heading)
+            boxes_xywha: [N, 5] GT boxes (cx_m, cy_m, w, l, heading) in ego frame
 
         Returns:
             centers_px: [N, 2] box centres in feature map pixel coords (col, row)
-                        col ∈ [0, feature_map_w-1]
-                        row ∈ [0, feature_map_h-1]
         """
         if boxes_xywha.shape[0] == 0:
             return torch.zeros(0, 2, device=boxes_xywha.device)
 
-        # Extract ego-frame centre positions in metres
-        cx_m = boxes_xywha[:, 0]  # [N] — forward/backward in ego frame
-        cy_m = boxes_xywha[:, 1]  # [N] — left/right in ego frame
+        cx_m = boxes_xywha[:, 0]   # forward in ego frame
+        cy_m = boxes_xywha[:, 1]   # lateral in ego frame
 
-        # Convert to BEV pixel coordinates
-        # SOURCED: pixel_x maps to y_ego (lateral), pixel_y maps to x_ego (forward)
-        # This is the convention used throughout Nadeem's BEV generation code
-        bev_pixel_x = BEV_PIXEL_OFFSET_X + cy_m / VOXEL_SIZE_M  # column
-        bev_pixel_y = BEV_PIXEL_OFFSET_Y - cx_m / VOXEL_SIZE_M  # row
+        bev_pixel_x = BEV_PIXEL_OFFSET_X + cy_m / VOXEL_SIZE_M   # column
+        bev_pixel_y = BEV_PIXEL_OFFSET_Y - cx_m / VOXEL_SIZE_M   # row
 
-        # Scale from BEV pixels to feature map pixels (divide by stride=8)
-        # SOURCED: stride=8 from patch_size=8 in vit_small_patch8_224
-        feature_stride = GRID_HEIGHT_PX // self.feature_map_h
-        # = 400 / 50 = 8
-        fm_pixel_x = bev_pixel_x / feature_stride  # column on feature map
-        fm_pixel_y = bev_pixel_y / feature_stride  # row on feature map
+        feature_stride = GRID_HEIGHT_PX // self.feature_map_h     # 8
+        fm_pixel_x = (bev_pixel_x / feature_stride).clamp(
+            0, self.feature_map_w - 1
+        )
+        fm_pixel_y = (bev_pixel_y / feature_stride).clamp(
+            0, self.feature_map_h - 1
+        )
 
-        # Clamp to valid feature map range
-        fm_pixel_x = fm_pixel_x.clamp(0, self.feature_map_w - 1)
-        fm_pixel_y = fm_pixel_y.clamp(0, self.feature_map_h - 1)
+        return torch.stack([fm_pixel_x, fm_pixel_y], dim=-1)
+        # [N, 2] — (col, row) on 50×90 feature map
 
-        # Stack as [N, 2] (col, row)
-        centers_px = torch.stack([fm_pixel_x, fm_pixel_y], dim=-1)
-        return centers_px
+    # =========================================================================
+    # forward
+    # =========================================================================
 
     def forward(
         self,
@@ -260,65 +296,54 @@ class IntentNetViT_MT(nn.Module):
         use_gt_boxes_for_traj: bool = True,
     ) -> dict:
         """
-        Forward pass of IntentNetViT_MT.
+        Forward pass — identical interface for all versions V1-V5.
 
         Args:
-            lidar_bev:  [B, 290, 400, 720] — LiDAR BEV tensor
-            map_bev:    [B,   9, 400, 720] — Map BEV tensor
-            gt_list:    list of GT dicts per batch element
-                        Required during training for teacher forcing.
-                        None during inference.
-            use_gt_boxes_for_traj: bool
-                        True  → use GT box centres for trajectory sampling
-                                 (teacher forcing during training)
-                        False → use predicted box centres after NMS
-                                 (inference mode)
-                        SOURCED: DeTra (Casas et al., 2024) — GT boxes
-                        during training decouples trajectory learning
-                        from detection errors.
+            lidar_bev:  [B, 290, 400, 720]
+            map_bev:    [B,   9, 400, 720]
+            gt_list:    list of GT dicts per batch element (training only)
+            use_gt_boxes_for_traj: True during training (teacher forcing)
 
         Returns:
-            dict with keys:
-                det_cls_logits:    [B, 22500, 1]    — detection objectness
-                det_box_preds:     [B, 22500, 6]    — box regression deltas
-                intention_logits:  [B, 22500, 8]    — intention class logits
-                anchors:           [22500, 5]        — anchor boxes
-                y_hat:             [F, N, 60, 4]    — trajectories (V2/V3 only)
-                pi:                [N, F]            — mode logits (V2/V3 only)
-                traj_gt_boxes:     [N, 5]            — boxes used for sampling
-                None for y_hat and pi when use_trajectory=False (V1 mode)
+            dict with:
+                det_cls_logits:   [B, 22500, 1]
+                det_box_preds:    [B, 22500, 6]
+                intention_logits: [B, 22500, 8]
+                anchors:          [22500, 5]
+                y_hat:            [F, N, 60, 4] or None (V1)
+                pi:               [N, F] or None (V1)
+                traj_gt_boxes:    [N, 5] or None (V1)
         """
         B = lidar_bev.shape[0]
         device = lidar_bev.device
 
         # =====================================================================
-        # Step 1: Shared backbone forward pass
-        # Input:  lidar_bev [B, 290, 400, 720]
-        #         map_bev   [B,   9, 400, 720]
-        # Output: feature_map [B, 512, 50, 90]
-        # SOURCED: TwoStreamViTBackbone.forward() — Nadeem's model_vit.py
+        # Step 1: Backbone
+        # Both TwoStreamViTBackbone and SwinBackbone output [B, 512, 50, 90]
         # =====================================================================
         feature_map = self.backbone(lidar_bev, map_bev)
         # [B, 512, 50, 90]
 
         # =====================================================================
-        # Step 2: Detection head
-        # SOURCED: Nadeem's original — unchanged
+        # Step 2: Detection head — unchanged for all versions
+        # SOURCED: Nadeem thesis Section 3.3
         # =====================================================================
         det_cls_logits, det_box_preds = self.det_head(feature_map)
         # det_cls_logits: [B, 22500, 1]
         # det_box_preds:  [B, 22500, 6]
 
         # =====================================================================
-        # Step 3: Intention head
-        # SOURCED: Nadeem's original — unchanged
+        # Step 3: Intention head — unchanged for all versions
+        # SOURCED: Nadeem thesis Section 3.3
         # =====================================================================
         intention_logits = self.intention_head(feature_map)
         # [B, 22500, 8]
 
         # =====================================================================
-        # Step 4: Trajectory head (V2/V3 only)
-        # NEW — not present in Nadeem's IntentNetViT
+        # Step 4: Trajectory head — V2 onwards only
+        # V1: skipped (traj_head is None)
+        # V2, V3: MLP decoder
+        # V4, V5: transformer decoder (not yet implemented)
         # =====================================================================
         y_hat = None
         pi = None
@@ -327,113 +352,78 @@ class IntentNetViT_MT(nn.Module):
         if self.use_trajectory and self.traj_head is not None:
 
             if use_gt_boxes_for_traj and gt_list is not None:
-                # --- Teacher forcing: use GT box locations ---
-                # During training we use the actual GT box centres to sample
-                # BEV features. This decouples trajectory learning from
-                # detection performance — in early training the detector is
-                # weak and would give bad box locations, which would corrupt
-                # the trajectory training signal.
-                # SOURCED: DeTra (Casas et al., 2024) — standard practice.
+                # Teacher forcing — use GT box centres for BEV feature sampling
+                # SOURCED: DeTra (Casas et al., 2024) — standard practice to
+                # decouple trajectory learning from detection errors in early training
+                gt_boxes_b0 = (
+                    gt_list[0]['boxes_xywha'].to(device)
+                    if gt_list[0] is not None
+                    else torch.zeros(0, 5, device=device)
+                )
+                traj_gt_boxes = gt_boxes_b0
 
-                # Collect GT boxes from all batch elements
-                # We process all vehicles from all frames together
-                all_gt_boxes = []
-                for b in range(B):
-                    if gt_list[b] is not None and 'boxes_xywha' in gt_list[b]:
-                        boxes_b = gt_list[b]['boxes_xywha'].to(device)
-                        if boxes_b.shape[0] > 0:
-                            all_gt_boxes.append(boxes_b)
+                if gt_boxes_b0.shape[0] > 0:
+                    box_centers_px = self._boxes_to_feature_map_pixels(
+                        gt_boxes_b0
+                    )
+                    # [N, 2] — (col, row) on 50×90 feature map
 
-                if len(all_gt_boxes) > 0:
-                    # Stack all GT boxes across the batch
-                    # Note: we use first batch element's feature map
-                    # for trajectory since N varies per element
-                    # For V2 we process batch element 0
-                    # This is a known simplification for single-scene inference
-                    # ASSUMED: single-scene processing for trajectory head
-                    # Full batch processing is a V3 improvement
-                    gt_boxes_b0 = gt_list[0]['boxes_xywha'].to(device) \
-                        if gt_list[0] is not None else torch.zeros(0, 5, device=device)
+                    box_params_m = gt_boxes_b0[:, :4]
+                    # [N, 4] — (cx_m, cy_m, w_m, l_m)
 
-                    traj_gt_boxes = gt_boxes_b0
-
-                    if gt_boxes_b0.shape[0] > 0:
-                        # Convert GT box centres to feature map pixel coords
-                        box_centers_px = self._boxes_to_feature_map_pixels(
-                            gt_boxes_b0
-                        )
-                        # [N, 2] — (col, row) on 50×90 feature map
-
-                        # Box params for concatenation with BEV features
-                        # Use (cx_m, cy_m, w_m, l_m) — first 4 columns
-                        box_params_m = gt_boxes_b0[:, :4]
-                        # [N, 4]
-
-                        # Run trajectory head
-                        # Takes feature map + box locations
-                        # Returns [F, N, 60, 4] and [N, F]
-                        y_hat, pi = self.traj_head(
-                            feature_map=feature_map,
-                            box_centers_px=box_centers_px,
-                            box_params_m=box_params_m,
-                            use_gt_boxes=True
-                        )
-                    else:
-                        # No GT boxes for this batch element
-                        F_modes = TRAJECTORY_NUM_MODES
-                        H = TRAJECTORY_FUTURE_STEPS
-                        y_hat = torch.zeros(F_modes, 0, H, 4, device=device)
-                        pi = torch.zeros(0, F_modes, device=device)
-
+                    y_hat, pi = self.traj_head(
+                        feature_map=feature_map,
+                        box_centers_px=box_centers_px,
+                        box_params_m=box_params_m,
+                        use_gt_boxes=True
+                    )
+                    # y_hat: [F, N, 60, 4]
+                    # pi:    [N, F]
+                else:
+                    F_modes = TRAJECTORY_NUM_MODES
+                    H = TRAJECTORY_FUTURE_STEPS
+                    y_hat = torch.zeros(F_modes, 0, H, 4, device=device)
+                    pi = torch.zeros(0, F_modes, device=device)
             else:
-                # --- Inference mode: use predicted box locations ---
-                # After NMS, the detected box centres are used to sample
-                # BEV features for trajectory prediction.
-                # This is handled by the inference pipeline, not here.
-                # For now, return None and handle in eval.py
-                # ASSUMED: inference trajectory prediction is handled
-                # post-NMS in the evaluation pipeline
+                # Inference mode — trajectory prediction from predicted boxes
+                # Handled post-NMS in eval.py
                 y_hat = None
                 pi = None
 
         return {
-            # Detection outputs — same as Nadeem's original
-            "det_cls_logits": det_cls_logits,   # [B, 22500, 1]
-            "det_box_preds": det_box_preds,      # [B, 22500, 6]
-
-            # Intention outputs — same as Nadeem's original
-            "intention_logits": intention_logits, # [B, 22500, 8]
-
-            # Anchors — needed by loss function
-            "anchors": self.anchors,              # [22500, 5]
-
-            # Trajectory outputs — new for V2/V3, None for V1
-            "y_hat": y_hat,    # [F, N, 60, 4] or None
-            "pi": pi,          # [N, F] or None
-
-            # GT boxes used for trajectory sampling (for loss alignment)
-            "traj_gt_boxes": traj_gt_boxes  # [N, 5] or None
+            "det_cls_logits":   det_cls_logits,    # [B, 22500, 1]
+            "det_box_preds":    det_box_preds,      # [B, 22500, 6]
+            "intention_logits": intention_logits,   # [B, 22500, 8]
+            "anchors":          self.anchors,       # [22500, 5]
+            "y_hat":            y_hat,              # [F, N, 60, 4] or None
+            "pi":               pi,                 # [N, F] or None
+            "traj_gt_boxes":    traj_gt_boxes       # [N, 5] or None
         }
+
+    # =========================================================================
+    # load_pretrained_backbone
+    # =========================================================================
 
     def load_pretrained_backbone(self, checkpoint_path: str) -> None:
         """
-        Load backbone weights from Nadeem's pretrained checkpoint.
+        Load backbone weights from a previous checkpoint.
 
-        This allows V2 to start from Nadeem's trained backbone rather
-        than training from scratch. Only backbone weights are loaded —
-        the new trajectory head starts from random initialisation.
+        For V3: not typically needed — Swin loads ImageNet pretrained weights
+        via timm automatically when pretrained=True.
 
-        SOURCED: approach of loading partial checkpoint is standard
-        transfer learning practice. The backbone is the shared component
-        whose weights benefit most from pretraining.
+        For V2 resuming from V1: loads ViT backbone weights from V1 checkpoint,
+        trajectory head starts from random initialisation.
+
+        SOURCED: standard transfer learning practice.
+        Howard & Ruder (ACL 2018) — fine-tuning pretrained models.
 
         Args:
-            checkpoint_path: path to Nadeem's vit_model.pth checkpoint
+            checkpoint_path: path to .pth checkpoint file
         """
-        checkpoint = torch.load(checkpoint_path, map_location='cpu',
-                                weights_only=False)
+        checkpoint = torch.load(
+            checkpoint_path, map_location='cpu', weights_only=False
+        )
 
-        # Handle different checkpoint formats
         if 'model_state_dict' in checkpoint:
             state_dict = checkpoint['model_state_dict']
         elif 'state_dict' in checkpoint:
@@ -441,7 +431,6 @@ class IntentNetViT_MT(nn.Module):
         else:
             state_dict = checkpoint
 
-        # Filter to only backbone weights
         backbone_state = {
             k.replace('backbone.', ''): v
             for k, v in state_dict.items()
@@ -452,18 +441,13 @@ class IntentNetViT_MT(nn.Module):
             missing, unexpected = self.backbone.load_state_dict(
                 backbone_state, strict=False
             )
-            print(f"Loaded backbone from: {checkpoint_path}")
+            print(f"Loaded backbone weights from: {checkpoint_path}")
             if missing:
-                print(f"  Missing keys: {len(missing)}")
+                print(f"  Missing keys:    {len(missing)}")
             if unexpected:
                 print(f"  Unexpected keys: {len(unexpected)}")
         else:
-            # Try loading full model weights and filtering
-            backbone_state_full = {
-                k: v for k, v in state_dict.items()
-                if 'backbone' in k or 'vit_lidar' in k or 'vit_map' in k
-            }
             print(
-                f"Warning: Could not find backbone weights with 'backbone.' prefix. "
-                f"Found {len(backbone_state_full)} potentially relevant keys."
+                f"Warning: No backbone weights found with 'backbone.' prefix "
+                f"in {checkpoint_path}."
             )
