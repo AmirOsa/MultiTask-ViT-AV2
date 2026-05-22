@@ -18,7 +18,7 @@ OUTPUT_BASE  = Path("/content/drive/MyDrive/Bachelor Thesis/MultiTask_V2/av2/mot
 HIST_STEPS   = 50
 FUTURE_STEPS = 60
 WINDOW_SIZE  = HIST_STEPS + FUTURE_STEPS
-STEP_SIZE    = 50
+STEP_SIZE    = 25
 MIN_OBSERVED_STEPS = 5
 
 MF_MAP = {
