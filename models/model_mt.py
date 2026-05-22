@@ -9,27 +9,50 @@
 #   V1: backbone='vit', use_trajectory=False
 #       Detection + intention only. Identical to Nadeem's IntentNetViT.
 #
-#   V2: backbone='vit', use_trajectory=True
+#   V2: backbone='vit', use_trajectory=True, decoder_type='mlp'
 #       Adds MLP trajectory decoder on top of same ViT backbone.
 #
-#   V3: backbone='swin', use_trajectory=True
+#   V3: backbone='swin', use_trajectory=True, decoder_type='mlp'
 #       Swaps backbone to Swin-T pretrained. MLP decoder unchanged.
 #       ONLY change vs V2 — isolates backbone contribution.
 #
+#   V3-traj: backbone='swin', use_trajectory=True, decoder_type='mlp'
+#       Same as V3 but trained on parquet scenarios.
+#       Ablation baseline for V4 trajectory comparison.
+#       Confirms MLP decoder performance on same data as V4.
+#
 #   V4: backbone='swin', use_trajectory=True, decoder_type='transformer'
-#       Adds transformer trajectory decoder + agent history.
-#       (decoder_type handled in trajectory_decoder.py — not yet implemented)
+#       Full trajectory system upgrade:
+#         - GRU history encoder [N, 50, 5] → [N, 64]
+#         - Social attention across N agents
+#         - Transformer cross-attention decoder
+#       Dual-dataset training: sensor → det+intent, parquet → trajectory
+#       SOURCED: heterogeneous multi-task learning — UniDet, OmniDet
 #
 #   V5: backbone='swin', use_trajectory=True, decoder_type='transformer'
-#       Adds class weights + 6s horizon + velocity heading.
-#       (supervision changes in loss.py and dataset.py)
+#       V4 + supervision fixes:
+#         - Inverse frequency class weights (C1)
+#         - 6s intention horizon (C2)
+#         - Velocity-based heading (C3)
 #
 # Backbone selection:
 #   'vit'  → TwoStreamViTBackbone (Nadeem's original, trained from scratch)
 #   'swin' → SwinBackbone (Swin-T pretrained ImageNet, new for V3+)
 #
+# Decoder selection (use_trajectory=True only):
+#   'mlp'         → BEVTrajectoryDecoder (V2, V3, V3-traj)
+#   'transformer' → TransformerTrajectoryDecoder (V4, V5)
+#
 # All heads (DetectionHead, IntentionHead, TrajectoryHead) are backbone-agnostic.
 # Both backbones output [B, 512, 50, 90] — heads work unchanged for all versions.
+#
+# Dual-dataset training (V4/V5):
+#   Two dataloaders run simultaneously:
+#     Sensor dataloader  → 7375 sequences → det+intent loss every iteration
+#     Parquet dataloader → 100 scenarios  → trajectory loss every ~70 iterations
+#   Both losses update the shared backbone.
+#   run_traj_head=False skips trajectory for sensor batches.
+#   run_traj_head=True  runs trajectory for parquet batches.
 
 import torch
 import torch.nn as nn
@@ -51,6 +74,8 @@ from utils.constants import (
     VOXEL_SIZE_M,
     BEV_PIXEL_OFFSET_X,
     BEV_PIXEL_OFFSET_Y,
+    AGENT_HISTORY_STEPS,
+    AGENT_HISTORY_FEATURES,
 )
 from utils.utils import generate_anchors
 
@@ -60,17 +85,24 @@ class IntentNetViT_MT(nn.Module):
     Multi-task model for joint vehicle detection, intention prediction,
     and trajectory forecasting from LiDAR BEV.
 
-    Supports V1 through V5 via backbone_type and use_trajectory flags.
-    All versions share the same heads — only the backbone changes between
-    V1/V2 (ViT) and V3/V4/V5 (Swin-T pretrained).
+    Supports V1 through V5 via backbone_type, decoder_type, and
+    use_trajectory flags. All versions share the same heads — only
+    the backbone and trajectory decoder change across versions.
 
-    Output feature map is always [B, 512, 50, 90] regardless of backbone,
-    so DetectionHead, IntentionHead, and TrajectoryHead are unchanged.
+    Both backbones output [B, 512, 50, 90] — heads are backbone-agnostic.
+    Both decoders output [F, N, 60, 4] — loss and eval code unchanged.
+
+    Dual-dataset training (V4/V5):
+        forward_det_intent_only() → sensor batches, det+intent only
+        forward_traj_only()       → parquet batches, trajectory only
+        Both methods call forward() with appropriate flags.
+        Both update the shared backbone through their respective losses.
 
     Args:
-        backbone_type:      'vit' for V1/V2, 'swin' for V3/V4/V5
-        backbone_cfg:       dict of kwargs for the selected backbone class
-        use_trajectory:     False for V1, True for V2-V5
+        backbone_type:       'vit' for V1/V2, 'swin' for V3/V4/V5
+        backbone_cfg:        dict of kwargs for selected backbone class
+        use_trajectory:      False for V1, True for V2-V5
+        decoder_type:        'mlp' for V2/V3/V3-traj, 'transformer' for V4/V5
         trajectory_head_cfg: optional kwargs for TrajectoryHead
     """
 
@@ -81,18 +113,22 @@ class IntentNetViT_MT(nn.Module):
         # 'swin' → SwinBackbone          (V3, V4, V5)
         backbone_cfg: dict | None = None,
         use_trajectory: bool = True,
+        decoder_type: str = 'mlp',
+        # 'mlp'         → BEVTrajectoryDecoder (V2, V3, V3-traj)
+        # 'transformer' → TransformerTrajectoryDecoder (V4, V5)
         trajectory_head_cfg: dict | None = None,
     ) -> None:
         super().__init__()
 
         self.use_trajectory = use_trajectory
         self.backbone_type = backbone_type
+        self.decoder_type = decoder_type
 
         if backbone_cfg is None:
             backbone_cfg = {}
 
         # Remove 'type' key — used for routing only, not passed to constructors
-        backbone_cfg.pop('type', None)    
+        backbone_cfg.pop('type', None)
 
         # =====================================================================
         # Backbone — selected by backbone_type
@@ -121,8 +157,8 @@ class IntentNetViT_MT(nn.Module):
                     'img_size', (GRID_HEIGHT_PX, GRID_WIDTH_PX)
                 ),
                 'window_size': backbone_cfg.get('window_size', 5),
-                # NEEDS TEST: 5 divides 100 and 180 evenly
-                # (feature map = 400/4=100, 720/4=180 with patch_size=4)
+                # window_size=5: 100/5=20 ✓, 180/5=36 ✓
+                # Confirmed working by forward pass test
                 'swin_model_name': backbone_cfg.get(
                     'swin_model_name', 'swin_tiny_patch4_window7_224'
                 ),
@@ -205,9 +241,17 @@ class IntentNetViT_MT(nn.Module):
 
         # =====================================================================
         # Trajectory Head — V2 onwards only
-        # V1: not created (use_trajectory=False)
-        # V2, V3: MLP decoder (BEVTrajectoryDecoder)
-        # V4, V5: transformer decoder (added in trajectory_decoder.py later)
+        #
+        # V1:       not created (use_trajectory=False)
+        # V2/V3:    MLP decoder (BEVTrajectoryDecoder)
+        #           No history, no social attention
+        # V3-traj:  MLP decoder, trained on parquet scenarios
+        #           Ablation baseline for V4 trajectory comparison
+        # V4/V5:    Transformer decoder (TransformerTrajectoryDecoder)
+        #           GRU history encoder + social attention + cross-attention
+        #
+        # decoder_type is passed to TrajectoryHead which routes to
+        # the correct decoder class in trajectory_decoder.py
         # =====================================================================
         if self.use_trajectory:
             if trajectory_head_cfg is None:
@@ -216,9 +260,12 @@ class IntentNetViT_MT(nn.Module):
                 backbone_channels=self.feature_channels,
                 feature_map_h=self.feature_map_h,
                 feature_map_w=self.feature_map_w,
+                decoder_type=decoder_type,
+                # 'mlp'         → V2, V3, V3-traj
+                # 'transformer' → V4, V5
                 **trajectory_head_cfg
             )
-            print("TrajectoryHead: ENABLED")
+            print(f"TrajectoryHead: ENABLED ({decoder_type} decoder)")
         else:
             self.traj_head = None
             print("TrajectoryHead: DISABLED (V1 mode)")
@@ -230,10 +277,13 @@ class IntentNetViT_MT(nn.Module):
         # =====================================================================
         anchors = generate_anchors()
         self.register_buffer('anchors', anchors)
+        # Registered as buffer: moves to GPU with .to(device)
+        # and saved with checkpoint
 
         print(
             f"\nIntentNetViT_MT Initialized:"
-            f"\n  Version:          {backbone_type.upper()} backbone"
+            f"\n  Backbone:         {backbone_type.upper()}"
+            f"\n  Decoder:          {decoder_type}"
             f"\n  Feature channels: {self.feature_channels}"
             f"\n  Feature map:      {self.feature_map_h}×{self.feature_map_w}"
             f"\n  Trajectory head:  {'ENABLED' if use_trajectory else 'DISABLED'}"
@@ -288,7 +338,7 @@ class IntentNetViT_MT(nn.Module):
         # [N, 2] — (col, row) on 50×90 feature map
 
     # =========================================================================
-    # forward
+    # forward — main forward pass for all versions
     # =========================================================================
 
     def forward(
@@ -297,38 +347,66 @@ class IntentNetViT_MT(nn.Module):
         map_bev: torch.Tensor,
         gt_list: list | None = None,
         use_gt_boxes_for_traj: bool = True,
+        agent_history: torch.Tensor | None = None,
+        # [N, 50, 5] — agent history from parquet files
+        # None for V2/V3 (MLP decoder — history not used)
+        # Required for V4/V5 (transformer decoder uses GRU history encoder)
+        # SOURCED: history features — Abdulbaki thesis Section 3.6
+        run_traj_head: bool = True,
+        # Controls trajectory head execution for dual-dataset training:
+        # True  → run trajectory head (V2/V3 normal, parquet batches V4/V5)
+        # False → skip trajectory head (sensor batches in V4/V5 dual training)
+        # Skipping trajectory head for sensor batches means det+intent losses
+        # only update the backbone for those batches — correct behaviour.
     ) -> dict:
         """
         Forward pass — identical interface for all versions V1-V5.
 
+        V1/V2/V3 usage (single dataset):
+            forward(lidar_bev, map_bev, gt_list=gt_list)
+            All heads run every batch.
+
+        V4/V5 dual-dataset usage:
+            Sensor batch:  forward(..., run_traj_head=False)
+                           Only det+intent heads contribute to loss.
+            Parquet batch: forward(..., agent_history=history, run_traj_head=True)
+                           Only trajectory head contributes to loss.
+            Both batches update the shared backbone.
+
         Args:
-            lidar_bev:  [B, 290, 400, 720]
-            map_bev:    [B,   9, 400, 720]
-            gt_list:    list of GT dicts per batch element (training only)
+            lidar_bev:             [B, 290, 400, 720]
+            map_bev:               [B,   9, 400, 720]
+            gt_list:               list of GT dicts per batch element
             use_gt_boxes_for_traj: True during training (teacher forcing)
+                                   SOURCED: DeTra (Casas et al., 2024)
+            agent_history:         [N, 50, 5] from parquet — V4/V5 only
+            run_traj_head:         False for sensor batches in dual training
 
         Returns:
             dict with:
-                det_cls_logits:   [B, 22500, 1]
-                det_box_preds:    [B, 22500, 6]
-                intention_logits: [B, 22500, 8]
-                anchors:          [22500, 5]
-                y_hat:            [F, N, 60, 4] or None (V1)
-                pi:               [N, F] or None (V1)
-                traj_gt_boxes:    [N, 5] or None (V1)
+                det_cls_logits:   [B, 22500, 1]  — detection objectness
+                det_box_preds:    [B, 22500, 6]  — box regression deltas
+                intention_logits: [B, 22500, 8]  — intention class logits
+                anchors:          [22500, 5]      — anchor boxes
+                y_hat:            [F, N, 60, 4]  — trajectories or None
+                pi:               [N, F]          — mode logits or None
+                traj_gt_boxes:    [N, 5]          — boxes used for sampling
+                feature_map:      [B, 512, 50, 90] — exposed for traj loss
         """
         B = lidar_bev.shape[0]
         device = lidar_bev.device
 
         # =====================================================================
-        # Step 1: Backbone
-        # Both TwoStreamViTBackbone and SwinBackbone output [B, 512, 50, 90]
+        # Step 1: Backbone — shared for ALL tasks and ALL versions
+        # Input:  lidar_bev [B, 290, 400, 720]
+        #         map_bev   [B,   9, 400, 720]
+        # Output: feature_map [B, 512, 50, 90]
         # =====================================================================
         feature_map = self.backbone(lidar_bev, map_bev)
         # [B, 512, 50, 90]
 
         # =====================================================================
-        # Step 2: Detection head — unchanged for all versions
+        # Step 2: Detection head — unchanged for all versions V1-V5
         # SOURCED: Nadeem thesis Section 3.3
         # =====================================================================
         det_cls_logits, det_box_preds = self.det_head(feature_map)
@@ -336,28 +414,38 @@ class IntentNetViT_MT(nn.Module):
         # det_box_preds:  [B, 22500, 6]
 
         # =====================================================================
-        # Step 3: Intention head — unchanged for all versions
+        # Step 3: Intention head — unchanged for all versions V1-V5
         # SOURCED: Nadeem thesis Section 3.3
         # =====================================================================
         intention_logits = self.intention_head(feature_map)
         # [B, 22500, 8]
 
         # =====================================================================
-        # Step 4: Trajectory head — V2 onwards only
-        # V1: skipped (traj_head is None)
-        # V2, V3: MLP decoder
-        # V4, V5: transformer decoder (not yet implemented)
+        # Step 4: Trajectory head
+        #
+        # Skipped when:
+        #   - V1 (use_trajectory=False, traj_head is None)
+        #   - Sensor batches in V4/V5 dual-dataset training (run_traj_head=False)
+        #
+        # Runs when:
+        #   - V2/V3 normal training (MLP decoder, all agents, sensor GT)
+        #   - V3-traj ablation (MLP decoder, parquet scenarios)
+        #   - V4/V5 parquet batches (transformer decoder, focal agent)
         # =====================================================================
         y_hat = None
         pi = None
         traj_gt_boxes = None
 
-        if self.use_trajectory and self.traj_head is not None:
+        if self.use_trajectory and self.traj_head is not None and run_traj_head:
 
             if use_gt_boxes_for_traj and gt_list is not None:
-                # Teacher forcing — use GT box centres for BEV feature sampling
-                # SOURCED: DeTra (Casas et al., 2024) — standard practice to
-                # decouple trajectory learning from detection errors in early training
+                # --- Teacher forcing: use GT box locations ---
+                # During training we use actual GT box centres to sample BEV
+                # features. This decouples trajectory learning from detection
+                # performance — avoids corrupted trajectory signal from bad
+                # detections in early training stages.
+                # SOURCED: DeTra (Casas et al., 2024) — standard practice.
+
                 gt_boxes_b0 = (
                     gt_list[0]['boxes_xywha'].to(device)
                     if gt_list[0] is not None
@@ -366,6 +454,7 @@ class IntentNetViT_MT(nn.Module):
                 traj_gt_boxes = gt_boxes_b0
 
                 if gt_boxes_b0.shape[0] > 0:
+                    # Convert GT box centres to feature map pixel coords
                     box_centers_px = self._boxes_to_feature_map_pixels(
                         gt_boxes_b0
                     )
@@ -373,35 +462,128 @@ class IntentNetViT_MT(nn.Module):
 
                     box_params_m = gt_boxes_b0[:, :4]
                     # [N, 4] — (cx_m, cy_m, w_m, l_m)
+                    # Used by MLP decoder only — transformer decoder ignores
 
+                    # Run trajectory head
+                    # agent_history: None for MLP, [N,50,5] for transformer
                     y_hat, pi = self.traj_head(
                         feature_map=feature_map,
                         box_centers_px=box_centers_px,
                         box_params_m=box_params_m,
+                        agent_history=agent_history,
+                        # None for V2/V3 (MLP decoder ignores it)
+                        # [N, 50, 5] for V4/V5 (transformer uses GRU encoder)
                         use_gt_boxes=True
                     )
                     # y_hat: [F, N, 60, 4]
                     # pi:    [N, F]
                 else:
+                    # No GT boxes for this batch element — return empty tensors
                     F_modes = TRAJECTORY_NUM_MODES
                     H = TRAJECTORY_FUTURE_STEPS
                     y_hat = torch.zeros(F_modes, 0, H, 4, device=device)
                     pi = torch.zeros(0, F_modes, device=device)
+
             else:
-                # Inference mode — trajectory prediction from predicted boxes
-                # Handled post-NMS in eval.py
+                # --- Inference mode ---
+                # After NMS, detected box centres are used for trajectory.
+                # Handled post-NMS in eval.py.
                 y_hat = None
                 pi = None
 
         return {
+            # Detection outputs — same as Nadeem's original, all versions
             "det_cls_logits":   det_cls_logits,    # [B, 22500, 1]
             "det_box_preds":    det_box_preds,      # [B, 22500, 6]
+
+            # Intention outputs — same as Nadeem's original, all versions
             "intention_logits": intention_logits,   # [B, 22500, 8]
+
+            # Anchors — needed by loss function
             "anchors":          self.anchors,       # [22500, 5]
+
+            # Trajectory outputs — V2+ only, None for V1
+            # Also None for sensor batches in V4/V5 dual-dataset training
             "y_hat":            y_hat,              # [F, N, 60, 4] or None
             "pi":               pi,                 # [N, F] or None
-            "traj_gt_boxes":    traj_gt_boxes       # [N, 5] or None
+
+            # GT boxes used for trajectory sampling (for loss alignment)
+            "traj_gt_boxes":    traj_gt_boxes,      # [N, 5] or None
+
+            # Expose feature map — needed for trajectory loss in parquet batches
+            # Not used in V1/V2/V3 loss computation
+            "feature_map":      feature_map,        # [B, 512, 50, 90]
         }
+
+    # =========================================================================
+    # Convenience methods for dual-dataset training (V4/V5)
+    # =========================================================================
+
+    def forward_det_intent_only(
+        self,
+        lidar_bev: torch.Tensor,
+        map_bev: torch.Tensor,
+        gt_list: list | None = None,
+    ) -> dict:
+        """
+        Sensor batch forward — detection + intention only.
+        Trajectory head is skipped (run_traj_head=False).
+
+        Used every iteration for sensor batches in V4/V5 dual training.
+        Detection and intention losses update the shared backbone.
+
+        SOURCED: heterogeneous multi-task learning — UniDet (Zhou et al.,
+        2021), OmniDet (Rashed et al., 2021) use per-task dataloaders
+        with a shared backbone updated by all task losses.
+        """
+        return self.forward(
+            lidar_bev=lidar_bev,
+            map_bev=map_bev,
+            gt_list=gt_list,
+            use_gt_boxes_for_traj=False,
+            agent_history=None,
+            run_traj_head=False,
+        )
+
+    def forward_traj_only(
+        self,
+        lidar_bev: torch.Tensor,
+        map_bev: torch.Tensor,
+        gt_boxes: torch.Tensor,
+        agent_history: torch.Tensor,
+    ) -> dict:
+        """
+        Parquet batch forward — trajectory head only.
+
+        Backbone + all heads run, but only trajectory loss is computed
+        in train.py for this batch. Detection and intention heads run
+        but their outputs are not used for loss in parquet batches.
+
+        Used every ~70 iterations for parquet batches in V4/V5 training.
+        Trajectory loss updates the shared backbone, GRU encoder,
+        social attention, and transformer decoder.
+
+        Args:
+            lidar_bev:     [B, 290, 400, 720] — matched sensor sequence
+            map_bev:       [B,   9, 400, 720] — matched sensor sequence
+            gt_boxes:      [N, 5] — agent boxes from parquet (ego frame)
+            agent_history: [N, 50, 5] — agent history from parquet
+                           SOURCED: Abdulbaki thesis Section 3.6
+
+        Returns:
+            dict with y_hat [F, N, 60, 4], pi [N, F], feature_map
+        """
+        # Wrap gt_boxes as gt_list format expected by forward()
+        gt_list = [{'boxes_xywha': gt_boxes}]
+
+        return self.forward(
+            lidar_bev=lidar_bev,
+            map_bev=map_bev,
+            gt_list=gt_list,
+            use_gt_boxes_for_traj=True,
+            agent_history=agent_history,
+            run_traj_head=True,
+        )
 
     # =========================================================================
     # load_pretrained_backbone
@@ -411,14 +593,17 @@ class IntentNetViT_MT(nn.Module):
         """
         Load backbone weights from a previous checkpoint.
 
-        For V3: not typically needed — Swin loads ImageNet pretrained weights
+        For V3/V4/V5: not needed — Swin loads ImageNet pretrained weights
         via timm automatically when pretrained=True.
 
-        For V2 resuming from V1: loads ViT backbone weights from V1 checkpoint,
-        trajectory head starts from random initialisation.
+        For V2 resuming from V1: loads ViT backbone weights from V1
+        checkpoint, trajectory head starts from random initialisation.
+
+        For V4 initialising from V3: loads Swin backbone from V3 checkpoint,
+        new trajectory head (GRU + social + transformer) starts from scratch.
 
         SOURCED: standard transfer learning practice.
-        Howard & Ruder (ACL 2018) — fine-tuning pretrained models.
+        Howard & Ruder (ACL 2018) — discriminative fine-tuning.
 
         Args:
             checkpoint_path: path to .pth checkpoint file
