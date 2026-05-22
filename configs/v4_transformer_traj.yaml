@@ -111,7 +111,7 @@ training:
   # Sensor dataloader batch size — same as V1/V2/V3
   # Parquet dataloader uses batch_size=1 (N varies per scenario)
 
-  num_epochs: 10
+  num_epochs: 3
   num_workers: 0
 
   optimizer:
