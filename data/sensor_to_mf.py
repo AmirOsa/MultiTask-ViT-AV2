@@ -266,7 +266,9 @@ def process_log(LOG_DIR):
             "TRUCK_CAB", "VEHICULAR_TRAILER", "BUS", "SCHOOL_BUS", "ARTICULATED_BUS"
         }
         vehicle_frame = current_frame[current_frame['category'].isin(VEHICLE_CATEGORIES)]
-        scoring_frame = vehicle_frame if not vehicle_frame.empty else current_frame
+        if vehicle_frame.empty:
+            continue
+        scoring_frame = vehicle_frame
         current_frame_sorted = scoring_frame.sort_values("score", ascending=False)
 
         focal_uuid = None
@@ -280,14 +282,15 @@ def process_log(LOG_DIR):
                     focal_uuid = candidate_uuid
                     break
 
-        # Fallback: no agent moves >3m, take highest obs_count
+        # Fallback: no agent moves >3m, take highest obs_count with min displacement
         if focal_uuid is None:
             for _, candidate_row in current_frame_sorted.iterrows():
                 candidate_uuid = candidate_row["track_uuid"]
                 if candidate_uuid in agent_dfs:
                     candidate_df = agent_dfs[candidate_uuid]
                     obs_count    = sum(ts in set(candidate_df.index) for ts in window_ts)
-                    if obs_count >= MIN_OBSERVED_STEPS:
+                    if (obs_count >= MIN_OBSERVED_STEPS and
+                            future_disp_map.get(candidate_uuid, 0.0) > 1.0):
                         focal_uuid = candidate_uuid
                         break
 
