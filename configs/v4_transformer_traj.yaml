@@ -95,12 +95,12 @@ data:
 
   gt_frame: "ego"
 
-  parquet_train_dir: "/content/drive/MyDrive/Bachelor Thesis/MultiTask_V2/av2/motion-forecasting/train"
+  parquet_train_dir: "/content/local_mf/train"
   # MF-format parquet scenarios from sensor_to_mf.py
   # 100 training scenarios from 50 sensor logs
   # Used for trajectory head training only (dual-dataset)
 
-  parquet_val_dir: "/content/drive/MyDrive/Bachelor Thesis/MultiTask_V2/av2/motion-forecasting/val"
+  parquet_val_dir: "/content/local_mf/val"
   # 48 val scenarios — used for trajectory evaluation
 
 # ─────────────────────────────────────────────
