@@ -631,6 +631,7 @@ class TransformerTrajectoryDecoder(nn.Module):
         """
         N = agent_bev_features.shape[0]
         num_modes = self.num_modes
+        hidden_size = self.hidden_size
 
         if N == 0:
             device = bev_feature_map.device
