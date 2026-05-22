@@ -278,7 +278,7 @@ def process_log(LOG_DIR):
                 candidate_df = agent_dfs[candidate_uuid]
                 obs_count    = sum(ts in set(candidate_df.index) for ts in window_ts)
                 if (obs_count >= MIN_OBSERVED_STEPS and
-                        future_disp_map.get(candidate_uuid, 0.0) > 3.0):
+                        future_disp_map.get(candidate_uuid, 0.0) > 10.0):
                     focal_uuid = candidate_uuid
                     break
 
@@ -290,7 +290,7 @@ def process_log(LOG_DIR):
                     candidate_df = agent_dfs[candidate_uuid]
                     obs_count    = sum(ts in set(candidate_df.index) for ts in window_ts)
                     if (obs_count >= MIN_OBSERVED_STEPS and
-                            future_disp_map.get(candidate_uuid, 0.0) > 1.0):
+                            future_disp_map.get(candidate_uuid, 0.0) > 5.0):
                         focal_uuid = candidate_uuid
                         break
 
