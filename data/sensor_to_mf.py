@@ -12,8 +12,8 @@ import pandas as pd
 # CONFIGURATION
 # ─────────────────────────────────────────────
 
-SENSOR_DIR   = Path("data/av2/sensor")
-OUTPUT_BASE  = Path("data/av2/sensor_as_mf")
+SENSOR_DIR   = Path("/content/drive/MyDrive/Bachelor Thesis/MultiTask_V2/av2/sensor/train")
+OUTPUT_BASE  = Path("/content/drive/MyDrive/Bachelor Thesis/MultiTask_V2/av2/motion-forecasting/train")
 
 HIST_STEPS   = 50
 FUTURE_STEPS = 60
