@@ -13,7 +13,7 @@ import pandas as pd
 # ─────────────────────────────────────────────
 
 SENSOR_DIR   = Path("/content/drive/MyDrive/Bachelor Thesis/MultiTask_V2/av2/sensor/train")
-OUTPUT_BASE  = Path("/content/drive/MyDrive/Bachelor Thesis/MultiTask_V2/av2/motion-forecasting/train")
+OUTPUT_BASE = Path("/content/local_mf/train")
 
 HIST_STEPS   = 50
 FUTURE_STEPS = 60
