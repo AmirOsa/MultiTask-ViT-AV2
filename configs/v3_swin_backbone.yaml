@@ -137,7 +137,7 @@ eval:
 checkpoints:
   save_dir: "/content/drive/MyDrive/Bachelor Thesis/Checkpoints"
   filename: "MultiTask_V3.pth"
-  resume: ""
+  resume: "/content/drive/MyDrive/Bachelor Thesis/Checkpoints/MultiTask_V3_epoch7.pth"
   # Fill in path to resume from a specific epoch checkpoint
   pretrained_v2: ""
   # Optional: initialise backbone from V2 checkpoint before fine-tuning
