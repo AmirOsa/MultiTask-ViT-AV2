@@ -699,12 +699,12 @@ class TransformerTrajectoryDecoder(nn.Module):
         # =================================================================
 
         # Expand mode queries for all agents
-        mode_q = self.mode_queries.unsqueeze(0).expand(N, num_modes, hidden_size)
+        mode_q = self.mode_queries.unsqueeze(0).expand(N, num_modes, self.hidden_size)
         # [N, num_modes, hidden_size]
 
         # Condition mode queries on agent feature
         # Each mode starts with shared agent context
-        agent_cond = agent_feat.unsqueeze(1).expand(N, num_modes, hidden_size)
+        agent_cond = agent_feat.unsqueeze(1).expand(N, num_modes, self.hidden_size)
         # [N, num_modes, hidden_size]
 
         tgt = mode_q + agent_cond
@@ -712,7 +712,7 @@ class TransformerTrajectoryDecoder(nn.Module):
         # mode_q gives mode diversity, agent_cond gives agent-specific context
 
         # BEV memory expanded for all agents
-        memory = bev_memory.unsqueeze(0).expand(N, -1, hidden_size)
+        memory = bev_memory.unsqueeze(0).expand(N, -1, self.hidden_size)
         # [N, 4500, hidden_size]
 
         # Cross-attention: mode queries attend to BEV feature map
