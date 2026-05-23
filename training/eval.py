@@ -544,8 +544,14 @@ def main_eval():
             'dropout':            get_nested(cfg, 'model', 'trajectory', 'dropout',             default=0.1),
         }
 
+    # Read backbone_type from checkpoint
+    saved_backbone_type = checkpoint.get('backbone_cfg', {}).get('type', backbone_type)
+    # Remove 'type' key before passing to constructor
+    saved_backbone_cfg.pop('type', None)
+
     try:
         model = IntentNetViT_MT(
+            backbone_type=saved_backbone_type,
             backbone_cfg=saved_backbone_cfg,
             use_trajectory=use_trajectory,
             decoder_type=saved_decoder_type,
