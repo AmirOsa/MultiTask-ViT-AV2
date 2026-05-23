@@ -66,6 +66,9 @@ data:
   gt_frame: "ego"
   # Trajectory GT in ego frame — same as V2
 
+  parquet_val_dir: "/content/local_mf/val"
+  # MF-format parquet scenarios from sensor_to_mf.py to compare with V4 trajectory evaluation
+
 # ─────────────────────────────────────────────
 # Training
 # ─────────────────────────────────────────────
@@ -126,6 +129,9 @@ eval:
   # Transform trajectory to agent-local frame for metrics
   # SOURCED: Abdulbaki thesis Section 3.6
   batch_size: 8
+
+  eval_focal_only: true                       
+  eval_all_agents: true
 
   trajectory_metrics:
     miss_rate_threshold_m: 2.0
