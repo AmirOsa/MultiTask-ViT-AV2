@@ -1,0 +1,139 @@
+# configs/v4_swin_backbone.yaml
+#
+# IntentTrajNet-AV2 — V4 Configuration
+# Change vs V3: backbone only — ViT scratch → Swin-T pretrained ImageNet
+# Everything else identical to V3 (transformer decoder, same loss, same λ=0.1)
+#
+# Research question:
+#   Does a pretrained hierarchical backbone improve detection, intention,
+#   and trajectory prediction quality on top of the proper trajectory system?
+#
+# Key fix vs original Swin attempt:
+#   lr_backbone raised from 1e-5 → 5e-5
+#   Original 1e-5 was too conservative for the ImageNet→LiDAR domain gap.
+#   The backbone barely updated, preventing adaptation to LiDAR BEV features.
+#   5e-5 gives 5× stronger gradient to bridge the domain gap in 10 epochs.
+#
+# SOURCED: Swin Transformer — Liu et al., ICCV 2021 Best Paper
+# SOURCED: ImageNet pretrained ViT transfers to LiDAR — RangeViT, CVPR 2023
+
+# ─────────────────────────────────────────────
+# Model
+# ─────────────────────────────────────────────
+model:
+  version: "V4"
+  use_trajectory: true
+
+  backbone:
+    type: "swin"
+    # SOURCED: Swin Transformer — Liu et al., ICCV 2021 Best Paper
+    swin_model_name: "swin_tiny_patch4_window7_224"
+    pretrained: true
+    # True → ImageNet pretrained weights loaded via timm
+    # SOURCED: RangeViT (CVPR 2023) — pretrained ViTs transfer to LiDAR
+    window_size: 5
+    # Confirmed working by forward pass test
+    # 100/5=20 ✓, 180/5=36 ✓
+    out_channels: 512
+    # Must match V3 feature channels so all heads work unchanged
+    # SOURCED: 512 from Nadeem thesis Section 3.3
+
+  trajectory:
+    decoder_type: "transformer"
+    # UNCHANGED from V3 — same transformer decoder
+    # Backbone swap is the ONLY change vs V3
+
+    future_steps: 60
+    num_modes: 6
+    hidden_size: 256
+    min_scale: 0.001
+    gru_hidden: 64
+    num_heads: 8
+    num_decoder_layers: 2
+    social_heads: 4
+    social_layers: 1
+    dropout: 0.1
+    # All values confirmed by V3 ablation — unchanged for V4
+
+# ─────────────────────────────────────────────
+# Data
+# ─────────────────────────────────────────────
+data:
+  train_dir: "/content/local_data/train"
+  val_dir:   "/content/local_data/val"
+  future_traj: true
+  gt_frame: "ego"
+
+  parquet_train_dir: "/content/local_mf/train"
+  parquet_val_dir:   "/content/local_mf/val"
+
+# ─────────────────────────────────────────────
+# Training
+# ─────────────────────────────────────────────
+training:
+  batch_size: 8
+  num_epochs: 10
+  num_workers: 0
+
+  optimizer:
+    type: "AdamW"
+    lr_backbone: 0.00005
+    # KEY FIX: raised from 0.00001 to 0.00005
+    # Original 1e-5 was too conservative for ImageNet→LiDAR domain gap
+    # 5e-5 gives backbone enough gradient to adapt to LiDAR BEV features
+    # while still preserving useful pretrained structure
+    lr_heads: 0.0001
+    # Standard LR for detection, intention, trajectory heads
+    # SOURCED: Nadeem thesis Section 3.4
+    weight_decay: 0.0001
+
+  scheduler:
+    type: "ReduceLROnPlateau"
+    mode: "min"
+    factor: 0.1
+    patience: 3
+
+# ─────────────────────────────────────────────
+# Loss
+# ─────────────────────────────────────────────
+loss:
+  use_rotated_iou: false
+  apply_intention_downsampling: true
+  intention_downsample_ratio: 0.85
+
+  iou_threshold: 0.6
+  neg_iou_threshold: 0.45
+  box_weight: 1.0
+  cls_weight: 1.0
+  intent_weight: 0.5
+
+  traj_lambda: 0.1
+  # UNCHANGED from V3 — same λ for fair comparison
+
+# ─────────────────────────────────────────────
+# Evaluation
+# ─────────────────────────────────────────────
+eval:
+  confidence_threshold: 0.1
+  nms_iou_threshold: 0.2
+  use_rotated_iou: false
+  use_rotated_nms: false
+  use_agent_local_traj: true
+  batch_size: 8
+
+  eval_focal_only: true
+  eval_all_agents: true
+
+  trajectory_metrics:
+    miss_rate_threshold_m: 2.0
+
+# ─────────────────────────────────────────────
+# Checkpoints
+# ─────────────────────────────────────────────
+checkpoints:
+  save_dir: "/content/drive/MyDrive/Bachelor Thesis/Checkpoints"
+  filename: "MultiTask_V4.pth"
+  resume: ""
+  pretrained_v3: ""
+  # Optional: initialise Swin backbone from V3 ViT checkpoint
+  # Not recommended — different architectures, weights incompatible
