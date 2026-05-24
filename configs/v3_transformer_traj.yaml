@@ -61,55 +61,63 @@ model:
 
     # GRU history encoder
     gru_hidden: 64
-    # ASSUMED: confirmed by 3-epoch ablation over {32, 64, 128}
+    # CONFIRMED by 2-epoch ablation over {32, 64, 128} on 10 logs / 20 parquet scenarios
+    # gru=64: Traj drop=2.46, Cls=0.649 — best trajectory drop, best detection
+    # gru=32: Traj drop=1.08, Cls=0.648 — underfits, insufficient capacity
+    # gru=128: Traj drop=1.66, Cls=0.661 — larger model hurts detection, less drop
 
     # Transformer decoder
     num_heads: 8
-    # ASSUMED: confirmed by 3-epoch ablation over {4, 8}
-    # Must divide hidden_size evenly: 256/8=32 ✓
+    # STANDARD PRACTICE: 256/8=32 dimensions per head — consistent with BERT-base
+    # Not ablated: standard default for hidden_size=256, no evidence to deviate
 
     num_decoder_layers: 2
-    # ASSUMED: confirmed by 3-epoch ablation over {1, 2, 3}
+    # STANDARD PRACTICE: conservative depth for small dataset (100 parquet scenarios)
+    # Deeper decoders (6+) overfit on small datasets; single layer may underfit
+    # Not ablated: 2 is a well-justified middle ground, noted as future work
 
     # Social attention
     social_heads: 4
-    # ASSUMED: confirmed by 3-epoch ablation over {2, 4}
-    # Must divide hidden_size evenly: 256/4=64 ✓
+    # STANDARD PRACTICE: 256/4=64 per head, identical to BERT-base per-head size
+    # Not ablated: standard for small-N self-attention (N<130 agents per scene)
 
     social_layers: 1
-    # ASSUMED: lightweight single layer
+    # STANDARD PRACTICE: single social attention layer used in HiVT, Social-LSTM
+    # Not ablated: universally accepted for social context encoding
 
     dropout: 0.1
-    # Regularization — important with only 100 training scenarios
+    # STANDARD PRACTICE: regularization for small dataset (100 parquet scenarios)
 
 # ─────────────────────────────────────────────
 # Data
 # ─────────────────────────────────────────────
 data:
   train_dir: "/content/local_data/train"
-  val_dir:   "/content/local_data/val"
+  # Full 50 sensor logs — 7375 sequences for detection + intention training
+  val_dir: "/content/local_data/val"
   future_traj: true
   gt_frame: "ego"
 
   parquet_train_dir: "/content/local_mf/train"
-  # 100 training scenarios — trajectory head training only
+  # Full 100 parquet scenarios — trajectory head training only
 
   parquet_val_dir: "/content/local_mf/val"
-  # 48 val scenarios — trajectory evaluation
+  # 48 val scenarios — trajectory evaluation (MF protocol)
 
 # ─────────────────────────────────────────────
 # Training
 # ─────────────────────────────────────────────
 training:
   batch_size: 8
-  num_epochs: 3
+  num_epochs: 10
+  # Full training — 10 epochs same as V1/V2
   num_workers: 0
 
   optimizer:
     type: "AdamW"
     lr: 0.0001
     # Single LR for all parameters — same as V1/V2
-    # No differential LR needed — ViT is trained from scratch
+    # No differential LR needed — ViT trained from scratch
     # SOURCED: Nadeem thesis Section 3.4
     weight_decay: 0.0001
 
@@ -135,8 +143,10 @@ loss:
   # UNCHANGED from V1/V2 — Nadeem thesis Section 3.4
 
   traj_lambda: 0.1
-  # Confirmed by 3-epoch ablation over {0.1, 0.3}
-  # λ=0.1 gave equivalent trajectory improvement with better detection stability
+  # CONFIRMED by 2-epoch ablation over {0.1, 0.3} on 10 logs / 20 parquet scenarios
+  # λ=0.1: Traj drop=2.46, Cls=0.649 — larger drop, better detection
+  # λ=0.3: Traj drop=1.43, Cls=0.668 — smaller drop, worse detection
+  # Consistent with Swin ablation result — λ=0.1 confirmed for both backbones
 
 # ─────────────────────────────────────────────
 # Evaluation
@@ -150,7 +160,9 @@ eval:
   batch_size: 8
 
   eval_focal_only: true
+  # Report focal-agent minADE (MF protocol — comparable to Abdulbaki)
   eval_all_agents: true
+  # Also report all-agent minADE (comparable to V2 auxiliary trajectory)
 
   trajectory_metrics:
     miss_rate_threshold_m: 2.0
@@ -163,6 +175,8 @@ checkpoints:
   save_dir: "/content/drive/MyDrive/Bachelor Thesis/Checkpoints"
   filename: "MultiTask_V3.pth"
   resume: ""
+  # Set to epoch checkpoint path to resume after Colab reset
+  # e.g. resume: "/content/drive/MyDrive/Bachelor Thesis/Checkpoints/MultiTask_V3_epoch7.pth"
   pretrained_v2: ""
   # Optional: initialise from V2 checkpoint
   # Backbone weights transfer, trajectory head initialises from scratch
