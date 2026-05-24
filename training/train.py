@@ -408,6 +408,8 @@ if __name__ == '__main__':
         ckpt = torch.load(RESUME_CHECKPOINT, map_location=DEVICE, weights_only=False)
         model.load_state_dict(ckpt['model_state_dict'])
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        if 'scheduler_state_dict' in ckpt:                         
+            scheduler.load_state_dict(ckpt['scheduler_state_dict'])
         start_epoch = ckpt['epoch']
         print(f"Resuming from epoch {start_epoch + 1}\n")
     else:
@@ -683,6 +685,7 @@ if __name__ == '__main__':
                 'model_version':       MODEL_VERSION,
                 'model_state_dict':    model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
                 'backbone_cfg':        BACKBONE_CFG,
                 'use_trajectory':      USE_TRAJECTORY,
                 'decoder_type':        decoder_type,
@@ -707,6 +710,7 @@ if __name__ == '__main__':
         'model_version':       MODEL_VERSION,
         'model_state_dict':    model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
         'backbone_cfg':        BACKBONE_CFG,
         'use_trajectory':      USE_TRAJECTORY,
         'decoder_type':        decoder_type,
