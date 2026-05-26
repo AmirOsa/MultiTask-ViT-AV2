@@ -271,6 +271,20 @@ def process_log(LOG_DIR):
         scoring_frame = vehicle_frame
         current_frame_sorted = scoring_frame.sort_values("score", ascending=False)
 
+        def is_in_bev(uuid):
+            """Check if agent is within BEV grid at current timestamp."""
+            if uuid not in agent_dfs:
+                return False
+            agent_df = agent_dfs[uuid]
+            if current_ts not in agent_df.index:
+                return False
+            row = agent_df.loc[current_ts]
+            if isinstance(row, pd.DataFrame):
+                row = row.iloc[0]
+            x = float(row['tx_m'])
+            y = float(row['ty_m'])
+            return (-40.0 <= x <= 40.0) and (-72.0 <= y <= 72.0)
+
         focal_uuid = None
         for _, candidate_row in current_frame_sorted.iterrows():
             candidate_uuid = candidate_row["track_uuid"]
@@ -278,11 +292,12 @@ def process_log(LOG_DIR):
                 candidate_df = agent_dfs[candidate_uuid]
                 obs_count    = sum(ts in set(candidate_df.index) for ts in window_ts)
                 if (obs_count >= MIN_OBSERVED_STEPS and
-                        future_disp_map.get(candidate_uuid, 0.0) > 10.0):
+                        future_disp_map.get(candidate_uuid, 0.0) > 10.0 and
+                        is_in_bev(candidate_uuid)):  # ADD THIS
                     focal_uuid = candidate_uuid
                     break
 
-        # Fallback: no agent moves >3m, take highest obs_count with min displacement
+        # Fallback
         if focal_uuid is None:
             for _, candidate_row in current_frame_sorted.iterrows():
                 candidate_uuid = candidate_row["track_uuid"]
@@ -290,12 +305,13 @@ def process_log(LOG_DIR):
                     candidate_df = agent_dfs[candidate_uuid]
                     obs_count    = sum(ts in set(candidate_df.index) for ts in window_ts)
                     if (obs_count >= MIN_OBSERVED_STEPS and
-                            future_disp_map.get(candidate_uuid, 0.0) > 5.0):
+                            future_disp_map.get(candidate_uuid, 0.0) > 5.0 and
+                            is_in_bev(candidate_uuid)):  # ADD THIS
                         focal_uuid = candidate_uuid
                         break
 
         if focal_uuid is None:
-            continue
+            continue  # no valid in-BEV focal agent for this window
 
         window_ts_set = set(window_ts)
         agent_window_counts = {
