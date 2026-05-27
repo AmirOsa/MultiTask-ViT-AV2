@@ -51,6 +51,42 @@ from training.loss import MultiTaskLoss
 from utils.utils import generate_anchors
 
 
+# =============================================================================
+# FIX: transform_to_agent_local
+# Transforms ego-frame GT trajectory to agent-local frame for trajectory loss.
+# SOURCED: Abdulbaki thesis Section 3.8 — loss computed in agent-local frame.
+# Formula: R^T(p^t - p^T) where p^T is agent current position, R is heading.
+# =============================================================================
+def transform_to_agent_local(traj_ego, boxes_xywha):
+    """
+    Transform trajectory from ego frame to agent-local frame.
+
+    Args:
+        traj_ego:    [N, H, 2] — GT trajectory in ego frame
+        boxes_xywha: [N, 5]   — GT boxes (cx, cy, w, h, heading) in ego frame
+
+    Returns:
+        [N, H, 2] — GT trajectory in agent-local frame
+    """
+    N = traj_ego.shape[0]
+    cx      = boxes_xywha[:, 0]
+    cy      = boxes_xywha[:, 1]
+    heading = boxes_xywha[:, 4]
+
+    # Subtract agent current position
+    agent_pos = torch.stack([cx, cy], dim=-1).unsqueeze(1)  # [N, 1, 2]
+    relative  = traj_ego - agent_pos                         # [N, H, 2]
+
+    # Rotate by negative heading to align with agent's local frame
+    cos_h = torch.cos(-heading).view(N, 1)  # [N, 1]
+    sin_h = torch.sin(-heading).view(N, 1)  # [N, 1]
+
+    local_x = cos_h * relative[..., 0] - sin_h * relative[..., 1]
+    local_y = sin_h * relative[..., 0] + cos_h * relative[..., 1]
+
+    return torch.stack([local_x, local_y], dim=-1)  # [N, H, 2]
+
+
 if __name__ == '__main__':
 
     # =========================================================================
@@ -84,10 +120,10 @@ if __name__ == '__main__':
 
     # Decoder type — NEW for V4/V5
     decoder_type = get_nested(cfg, 'model', 'trajectory', 'decoder_type', default='mlp')
-    # 'mlp'         → V2, V3, V3-traj
-    # 'transformer' → V4, V5
+    # 'mlp'         → V2, V3-traj
+    # 'transformer' → V3, V4, V5
 
-    # Trajectory head hyperparameters (V4/V5 transformer decoder)
+    # Trajectory head hyperparameters (transformer decoder)
     gru_hidden         = get_nested(cfg, 'model', 'trajectory', 'gru_hidden',         default=64)
     num_heads          = get_nested(cfg, 'model', 'trajectory', 'num_heads',           default=8)
     num_decoder_layers = get_nested(cfg, 'model', 'trajectory', 'num_decoder_layers',  default=2)
@@ -99,10 +135,13 @@ if __name__ == '__main__':
     TRAIN_DATA_DIR   = get_nested(cfg, 'data', 'train_dir',   default='')
     USE_FUTURE_TRAJ  = get_nested(cfg, 'data', 'future_traj', default=False)
 
-    # Parquet data — NEW for V4/V5
+    # Parquet data
     PARQUET_TRAIN_DIR = get_nested(cfg, 'data', 'parquet_train_dir', default='')
-    USE_PARQUET       = (decoder_type == 'transformer') and bool(PARQUET_TRAIN_DIR)
-    # True only for V4/V5 with transformer decoder and parquet dir configured
+
+    # FIX: USE_PARQUET enabled for any model with parquet_train_dir set,
+    # regardless of decoder_type. This allows V3-traj (MLP decoder + parquet)
+    # to also use dual-dataset training.
+    USE_PARQUET = bool(PARQUET_TRAIN_DIR)
 
     # Training
     TRAIN_BATCH_SIZE = get_nested(cfg, 'training', 'batch_size',   default=8)
@@ -204,7 +243,7 @@ if __name__ == '__main__':
         )
 
     # =========================================================================
-    # Trajectory head config (V4/V5 only)
+    # Trajectory head config
     # =========================================================================
     TRAJECTORY_HEAD_CFG = {}
     if decoder_type == 'transformer':
@@ -272,12 +311,12 @@ if __name__ == '__main__':
         exit()
 
     # =========================================================================
-    # Parquet Dataset and DataLoader — NEW for V4/V5
+    # Parquet Dataset and DataLoader
     # Used for trajectory training only
     # =========================================================================
     parquet_loader = None
     parquet_iter   = None
-    PARQUET_FREQ   = 1  # use parquet batch every N sensor batches
+    PARQUET_FREQ   = 1
 
     if USE_PARQUET:
         parquet_dir = Path(PARQUET_TRAIN_DIR)
@@ -295,8 +334,6 @@ if __name__ == '__main__':
             parquet_loader = DataLoader(
                 parquet_dataset,
                 batch_size=1,
-                # Batch size 1 — N varies per scenario
-                # Larger batches require padding logic not yet implemented
                 shuffle=True,
                 num_workers=0,
                 collate_fn=parquet_collate_fn,
@@ -307,12 +344,9 @@ if __name__ == '__main__':
 
             # How often to inject a parquet batch
             # Target: parquet dataset completes ~1 pass per epoch
-            # sensor_batches / parquet_batches = 922 / 13 ≈ 70
-            n_sensor = len(train_loader)
+            n_sensor  = len(train_loader)
             n_parquet = len(parquet_loader)
             PARQUET_FREQ = max(1, n_sensor // n_parquet)
-            # Every PARQUET_FREQ sensor batches, inject one parquet batch
-            # This ensures both datasets complete ~1 pass per epoch
 
             parquet_iter = iter(parquet_loader)
             print(
@@ -359,7 +393,7 @@ if __name__ == '__main__':
 
     # =========================================================================
     # Optimizer
-    # V3/V4/V5: differential LR — lower for pretrained Swin backbone
+    # V4/V5: differential LR — lower for pretrained Swin backbone
     # SOURCED: Howard & Ruder (ACL 2018) — discriminative fine-tuning
     # =========================================================================
     if LR_BACKBONE and LR_HEADS and backbone_type == 'swin':
@@ -408,7 +442,7 @@ if __name__ == '__main__':
         ckpt = torch.load(RESUME_CHECKPOINT, map_location=DEVICE, weights_only=False)
         model.load_state_dict(ckpt['model_state_dict'])
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        if 'scheduler_state_dict' in ckpt:                         
+        if 'scheduler_state_dict' in ckpt:
             scheduler.load_state_dict(ckpt['scheduler_state_dict'])
         start_epoch = ckpt['epoch']
         print(f"Resuming from epoch {start_epoch + 1}\n")
@@ -451,7 +485,8 @@ if __name__ == '__main__':
             optimizer.zero_grad()
 
             # =================================================================
-            # V1/V2/V3 training path — single dataset, all heads
+            # Single-dataset training path (no parquet)
+            # Used when parquet_train_dir is not set in config
             # =================================================================
             if not USE_PARQUET:
                 # Standard forward pass — all heads run
@@ -498,11 +533,13 @@ if __name__ == '__main__':
                 loss = loss_dict["loss"]
 
             # =================================================================
-            # V4/V5 dual-dataset training path
+            # Dual-dataset training path (with parquet)
+            # Used when parquet_train_dir is set in config
+            # Sensor batches: detection + intention every iteration
+            # Parquet batches: trajectory every PARQUET_FREQ iterations
             # =================================================================
             else:
                 # --- Sensor batch: detection + intention only ---
-                # run_traj_head=False skips trajectory head for this batch
                 sensor_outputs = model.forward_det_intent_only(
                     lidar_bev=lidar_bev,
                     map_bev=map_bev,
@@ -531,11 +568,11 @@ if __name__ == '__main__':
 
                 # Build loss_dict for logging
                 loss_dict = {
-                    "loss":           loss,
-                    "cls_loss":       det_intent_loss_dict["cls_loss"],
-                    "box_loss":       det_intent_loss_dict["box_loss"],
-                    "intent_loss":    det_intent_loss_dict["intent_loss"],
-                    "traj_loss":      torch.tensor(0.0, device=DEVICE),
+                    "loss":            loss,
+                    "cls_loss":        det_intent_loss_dict["cls_loss"],
+                    "box_loss":        det_intent_loss_dict["box_loss"],
+                    "intent_loss":     det_intent_loss_dict["intent_loss"],
+                    "traj_loss":       torch.tensor(0.0, device=DEVICE),
                     "num_pos_anchors": det_intent_loss_dict["num_pos_anchors"],
                 }
 
@@ -559,11 +596,11 @@ if __name__ == '__main__':
                             p_map   = parquet_batch["map_bev"].to(DEVICE)
 
                             # Get focal agent data for batch element 0
-                            p_gt_boxes    = parquet_batch["gt_boxes"][0].to(DEVICE)
-                            p_history     = parquet_batch["agent_history"][0].to(DEVICE)
-                            p_traj_focal  = parquet_batch["gt_traj_focal"][0].to(DEVICE)
-                            p_mask_focal  = parquet_batch["gt_mask_focal"][0].to(DEVICE)
-                            p_focal_idx   = parquet_batch["focal_idx"][0]
+                            p_gt_boxes   = parquet_batch["gt_boxes"][0].to(DEVICE)
+                            p_history    = parquet_batch["agent_history"][0].to(DEVICE)
+                            p_traj_focal = parquet_batch["gt_traj_focal"][0].to(DEVICE)
+                            p_mask_focal = parquet_batch["gt_mask_focal"][0].to(DEVICE)
+                            p_focal_idx  = parquet_batch["focal_idx"][0]
 
                             if p_gt_boxes.shape[0] > 0:
                                 # Forward pass — trajectory head only
@@ -577,11 +614,12 @@ if __name__ == '__main__':
                                 y_hat_parquet = parquet_outputs.get("y_hat")
                                 pi_parquet    = parquet_outputs.get("pi")
 
-                                if y_hat_parquet is not None and y_hat_parquet.shape[1] > 0:
-                                    # Extract focal agent predictions only
-                                    # Training loss on focal agent only
-                                    # SOURCED: AV2 MF standard protocol
+                                if (y_hat_parquet is not None and
+                                        y_hat_parquet.shape[1] > 0):
                                     if p_focal_idx < y_hat_parquet.shape[1]:
+                                        # Extract focal agent predictions only
+                                        # Training loss on focal agent only
+                                        # SOURCED: AV2 MF standard protocol
                                         y_hat_focal = y_hat_parquet[
                                             :, p_focal_idx:p_focal_idx+1, :, :
                                         ]
@@ -592,15 +630,31 @@ if __name__ == '__main__':
                                         # [1, F]
 
                                         gt_traj_focal_batch = p_traj_focal.unsqueeze(0)
-                                        # [1, 60, 2]
+                                        # [1, 60, 2] — ego frame
                                         gt_mask_focal_batch = p_mask_focal.unsqueeze(0)
                                         # [1, 60]
 
-                                        # Trajectory loss on focal agent
+                                        # FIX: Transform GT from ego frame to agent-local frame
+                                        # before computing trajectory loss.
+                                        # SOURCED: Abdulbaki thesis Section 3.8
+                                        # Formula: R^T(p^t - p^T)
+                                        # where p^T = agent current position,
+                                        # R = rotation matrix from heading angle.
+                                        focal_box = p_gt_boxes[
+                                            p_focal_idx:p_focal_idx+1
+                                        ]
+                                        # [1, 5]
+
+                                        gt_traj_local = transform_to_agent_local(
+                                            gt_traj_focal_batch,  # [1, 60, 2] ego frame
+                                            focal_box             # [1, 5]
+                                        )
+                                        # [1, 60, 2] agent-local frame
+
                                         traj_loss_out = loss_fn.traj_loss_fn(
                                             y_hat=y_hat_focal,
                                             pi=pi_focal,
-                                            gt_traj=gt_traj_focal_batch,
+                                            gt_traj=gt_traj_local,  # agent-local
                                             gt_mask=gt_mask_focal_batch,
                                         )
                                         traj_loss = traj_loss_out["loss"]
@@ -608,12 +662,14 @@ if __name__ == '__main__':
                                         if not (torch.isnan(traj_loss) or
                                                 torch.isinf(traj_loss)):
                                             # Add weighted trajectory loss
-                                            # to detection+intention loss
                                             loss = loss + TRAJ_LAMBDA * traj_loss
                                             loss_dict["traj_loss"] = traj_loss.detach()
 
                         except Exception as e:
-                            print(f"Warning: Parquet batch error at batch {batch_idx}: {e}")
+                            print(
+                                f"Warning: Parquet batch error at "
+                                f"batch {batch_idx}: {e}"
+                            )
 
             # =================================================================
             # Backward pass — same for both training paths
@@ -679,18 +735,20 @@ if __name__ == '__main__':
             # Save epoch checkpoint
             save_dir = Path(MODEL_SAVE_DIR)
             save_dir.mkdir(parents=True, exist_ok=True)
-            epoch_save_path = save_dir / f"MultiTask_{MODEL_VERSION}_epoch{epoch+1}.pth"
+            epoch_save_path = (
+                save_dir / f"MultiTask_{MODEL_VERSION}_epoch{epoch+1}.pth"
+            )
             torch.save({
-                'epoch':               epoch + 1,
-                'model_version':       MODEL_VERSION,
-                'model_state_dict':    model.state_dict(),
+                'epoch':                epoch + 1,
+                'model_version':        MODEL_VERSION,
+                'model_state_dict':     model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
-                'backbone_cfg':        BACKBONE_CFG,
-                'use_trajectory':      USE_TRAJECTORY,
-                'decoder_type':        decoder_type,
-                'traj_lambda':         TRAJ_LAMBDA,
-                'config_path':         str(config_path),
+                'backbone_cfg':         BACKBONE_CFG,
+                'use_trajectory':       USE_TRAJECTORY,
+                'decoder_type':         decoder_type,
+                'traj_lambda':          TRAJ_LAMBDA,
+                'config_path':          str(config_path),
             }, epoch_save_path)
             print(f"Checkpoint saved: {epoch_save_path}")
 
@@ -706,16 +764,16 @@ if __name__ == '__main__':
     save_path = save_dir / SAVE_FILENAME
 
     torch.save({
-        'epoch':               NUM_EPOCHS,
-        'model_version':       MODEL_VERSION,
-        'model_state_dict':    model.state_dict(),
+        'epoch':                NUM_EPOCHS,
+        'model_version':        MODEL_VERSION,
+        'model_state_dict':     model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
-        'backbone_cfg':        BACKBONE_CFG,
-        'use_trajectory':      USE_TRAJECTORY,
-        'decoder_type':        decoder_type,
-        'traj_lambda':         TRAJ_LAMBDA,
-        'config_path':         str(config_path),
+        'backbone_cfg':         BACKBONE_CFG,
+        'use_trajectory':       USE_TRAJECTORY,
+        'decoder_type':         decoder_type,
+        'traj_lambda':          TRAJ_LAMBDA,
+        'config_path':          str(config_path),
     }, save_path)
 
     print(f"Saved: {save_path}")
