@@ -283,7 +283,7 @@ def process_log(LOG_DIR):
                 row = row.iloc[0]
             x = float(row['tx_m'])
             y = float(row['ty_m'])
-            return (-40.0 <= x <= 40.0) and (-72.0 <= y <= 72.0)
+            return (-20.0 <= x <= 60.0) and (-72.0 <= y <= 72.0)
 
         focal_uuid = None
         for _, candidate_row in current_frame_sorted.iterrows():
