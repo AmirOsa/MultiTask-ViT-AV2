@@ -1,0 +1,142 @@
+# configs/v3_traj_ablation.yaml
+#
+# IntentTrajNet-AV2 — V3-traj Configuration
+# Ablation baseline for V3 trajectory comparison.
+#
+# V3-traj = V3 but with MLP decoder instead of transformer decoder.
+# Everything else identical to V3:
+#   - Same ViT backbone (from scratch)
+#   - Same dual-dataset training (sensor + parquet)
+#   - Same focal agent only trajectory loss
+#   - Same λ=0.1
+#   - Same 91 parquet training scenarios
+#
+# Purpose:
+#   Direct comparison with V3 on same 45 parquet val scenarios.
+#   Any difference in minADE = pure architecture contribution
+#   (transformer decoder + GRU + social attention vs MLP).
+#
+# SOURCED: MLP decoder — adapted from HiVT MLPDecoder
+# SOURCED: dual-dataset training — UniDet (Zhou et al., 2021)
+
+# ─────────────────────────────────────────────
+# Model
+# ─────────────────────────────────────────────
+model:
+  version: "V3-traj"
+  use_trajectory: true
+
+  backbone:
+    type: "vit"
+    # UNCHANGED from V2/V3 — same ViT backbone
+    # SOURCED: Nadeem thesis Section 3.3
+    vit_model_name_lidar: "vit_small_patch8_224"
+    vit_model_name_map: "vit_small_patch8_224"
+    pretrained_lidar: false
+    pretrained_map: false
+    lidar_adapter_out_channels: 192
+    map_adapter_out_channels: 192
+    fusion_block_planes: 512
+    fusion_block_layers: 2
+    fusion_block_kernel_size: 3
+    fusion_block_stride: 1
+
+  trajectory:
+    decoder_type: "mlp"
+    # MLP decoder — same as V2
+    # No GRU history encoder
+    # No social attention
+    # No transformer cross-attention
+    # Only difference from V3
+
+    future_steps: 60
+    # SOURCED: Abdulbaki thesis Section 3.1
+
+    num_modes: 6
+    # SOURCED: Abdulbaki thesis Section 3.4.3
+
+    hidden_size: 256
+    # SOURCED: V2 ablation confirmed 256
+
+    min_scale: 0.001
+    # SOURCED: HiVT decoder.py
+
+# ─────────────────────────────────────────────
+# Data
+# ─────────────────────────────────────────────
+data:
+  train_dir: "/content/local_data/train"
+  val_dir:   "/content/local_data/val"
+  future_traj: true
+  gt_frame: "ego"
+
+  parquet_train_dir: "/content/local_mf/train"
+  # 91 parquet scenarios — same as V3
+
+  parquet_val_dir: "/content/local_mf/val"
+  # 45 val scenarios — same as V3
+
+# ─────────────────────────────────────────────
+# Training
+# ─────────────────────────────────────────────
+training:
+  batch_size: 8
+  num_epochs: 10
+  num_workers: 0
+
+  optimizer:
+    type: "AdamW"
+    lr: 0.0001
+    # Same as V2/V3 — ViT trained from scratch
+    # SOURCED: Nadeem thesis Section 3.4
+    weight_decay: 0.0001
+
+  scheduler:
+    type: "ReduceLROnPlateau"
+    mode: "min"
+    factor: 0.1
+    patience: 3
+
+# ─────────────────────────────────────────────
+# Loss
+# ─────────────────────────────────────────────
+loss:
+  use_rotated_iou: false
+  apply_intention_downsampling: true
+  intention_downsample_ratio: 0.85
+
+  iou_threshold: 0.6
+  neg_iou_threshold: 0.45
+  box_weight: 1.0
+  cls_weight: 1.0
+  intent_weight: 0.5
+  # UNCHANGED from V1/V2/V3
+
+  traj_lambda: 0.1
+  # Same as V3 — confirmed by ablation
+
+# ─────────────────────────────────────────────
+# Evaluation
+# ─────────────────────────────────────────────
+eval:
+  confidence_threshold: 0.1
+  nms_iou_threshold: 0.2
+  use_rotated_iou: false
+  use_rotated_nms: false
+  use_agent_local_traj: true
+  batch_size: 8
+
+  eval_focal_only: true
+  eval_all_agents: true
+
+  trajectory_metrics:
+    miss_rate_threshold_m: 2.0
+    # SOURCED: Abdulbaki thesis Section 3.7
+
+# ─────────────────────────────────────────────
+# Checkpoints
+# ─────────────────────────────────────────────
+checkpoints:
+  save_dir: "/content/drive/MyDrive/Bachelor Thesis/Checkpoints"
+  filename: "MultiTask_V3traj.pth"
+  resume: ""
