@@ -21,6 +21,8 @@
 #  10. Fixed epoch checkpoint naming — MODEL_VERSION not hardcoded V1
 #  11. All original training logic unchanged (AdamW, ReduceLROnPlateau,
 #      NaN detection, progress bar, checkpoint saving)
+#  12. Added parquet val trajectory loss monitoring per epoch
+#      to detect overfitting early (train vs val gap tracking)
 
 import sys
 from pathlib import Path
@@ -53,38 +55,102 @@ from utils.utils import generate_anchors
 
 # =============================================================================
 # FIX: transform_to_agent_local
-# Transforms ego-frame GT trajectory to agent-local frame for trajectory loss.
-# SOURCED: Abdulbaki thesis Section 3.8 — loss computed in agent-local frame.
-# Formula: R^T(p^t - p^T) where p^T is agent current position, R is heading.
 # =============================================================================
 def transform_to_agent_local(traj_ego, boxes_xywha):
-    """
-    Transform trajectory from ego frame to agent-local frame.
-
-    Args:
-        traj_ego:    [N, H, 2] — GT trajectory in ego frame
-        boxes_xywha: [N, 5]   — GT boxes (cx, cy, w, h, heading) in ego frame
-
-    Returns:
-        [N, H, 2] — GT trajectory in agent-local frame
-    """
-    N = traj_ego.shape[0]
+    N       = traj_ego.shape[0]
     cx      = boxes_xywha[:, 0]
     cy      = boxes_xywha[:, 1]
     heading = boxes_xywha[:, 4]
-
-    # Subtract agent current position
-    agent_pos = torch.stack([cx, cy], dim=-1).unsqueeze(1)  # [N, 1, 2]
-    relative  = traj_ego - agent_pos                         # [N, H, 2]
-
-    # Rotate by negative heading to align with agent's local frame
-    cos_h = torch.cos(-heading).view(N, 1)  # [N, 1]
-    sin_h = torch.sin(-heading).view(N, 1)  # [N, 1]
-
+    agent_pos = torch.stack([cx, cy], dim=-1).unsqueeze(1)
+    relative  = traj_ego - agent_pos
+    cos_h = torch.cos(-heading).view(N, 1)
+    sin_h = torch.sin(-heading).view(N, 1)
     local_x = cos_h * relative[..., 0] - sin_h * relative[..., 1]
     local_y = sin_h * relative[..., 0] + cos_h * relative[..., 1]
+    return torch.stack([local_x, local_y], dim=-1)
 
-    return torch.stack([local_x, local_y], dim=-1)  # [N, H, 2]
+
+# =============================================================================
+# NEW: evaluate_val_traj_loss
+# Computes trajectory loss on parquet val set to detect overfitting.
+# Called at end of each epoch when USE_PARQUET is True.
+# =============================================================================
+def evaluate_val_traj_loss(
+    model,
+    parquet_val_loader,
+    loss_fn,
+    device,
+    decoder_type,
+):
+    """
+    Compute mean trajectory loss on parquet val scenarios.
+    Used to monitor train vs val gap for overfitting detection.
+
+    Returns:
+        mean val trajectory loss (float), or None if no valid batches
+    """
+    model.eval()
+    val_traj_losses = []
+
+    with torch.no_grad():
+        for val_batch in parquet_val_loader:
+            if val_batch is None:
+                continue
+            try:
+                p_lidar      = val_batch["lidar_bev"].to(device)
+                p_map        = val_batch["map_bev"].to(device)
+                p_gt_boxes   = val_batch["gt_boxes"][0].to(device)
+                p_history    = val_batch["agent_history"][0].to(device)
+                p_traj_focal = val_batch["gt_traj_focal"][0].to(device)
+                p_mask_focal = val_batch["gt_mask_focal"][0].to(device)
+                p_focal_idx  = val_batch["focal_idx"][0]
+
+                if p_gt_boxes.shape[0] == 0:
+                    continue
+
+                parquet_outputs = model.forward_traj_only(
+                    lidar_bev=p_lidar,
+                    map_bev=p_map,
+                    gt_boxes=p_gt_boxes,
+                    agent_history=p_history,
+                )
+
+                y_hat = parquet_outputs.get("y_hat")
+                pi    = parquet_outputs.get("pi")
+
+                if y_hat is None or y_hat.shape[1] == 0:
+                    continue
+
+                if p_focal_idx >= y_hat.shape[1]:
+                    continue
+
+                y_hat_focal = y_hat[:, p_focal_idx:p_focal_idx+1, :, :]
+                pi_focal    = pi[p_focal_idx:p_focal_idx+1, :]
+                gt_traj     = p_traj_focal.unsqueeze(0)
+                gt_mask     = p_mask_focal.unsqueeze(0)
+
+                focal_box     = p_gt_boxes[p_focal_idx:p_focal_idx+1]
+                gt_traj_local = transform_to_agent_local(gt_traj, focal_box)
+
+                traj_out = loss_fn.traj_loss_fn(
+                    y_hat=y_hat_focal,
+                    pi=pi_focal,
+                    gt_traj=gt_traj_local,
+                    gt_mask=gt_mask,
+                )
+
+                loss_val = traj_out["loss"].item()
+                if not (np.isnan(loss_val) or np.isinf(loss_val)):
+                    val_traj_losses.append(loss_val)
+
+            except Exception:
+                continue
+
+    model.train()
+
+    if val_traj_losses:
+        return float(np.mean(val_traj_losses))
+    return None
 
 
 if __name__ == '__main__':
@@ -98,12 +164,9 @@ if __name__ == '__main__':
     # =========================================================================
     # Read all settings from config
     # =========================================================================
-
-    # Model
     MODEL_VERSION  = get_nested(cfg, 'model', 'version', default='V2')
     USE_TRAJECTORY = get_nested(cfg, 'model', 'use_trajectory', default=False)
 
-    # Backbone
     backbone_type    = get_nested(cfg, 'model', 'backbone', 'type', default='vit')
     pretrained       = get_nested(cfg, 'model', 'backbone', 'pretrained', default=False)
     swin_model_name  = get_nested(
@@ -118,12 +181,8 @@ if __name__ == '__main__':
     pretrained_lidar = get_nested(cfg, 'model', 'backbone', 'pretrained_lidar', default=False)
     pretrained_map   = get_nested(cfg, 'model', 'backbone', 'pretrained_map',   default=False)
 
-    # Decoder type — NEW for V4/V5
     decoder_type = get_nested(cfg, 'model', 'trajectory', 'decoder_type', default='mlp')
-    # 'mlp'         → V2, V3-traj
-    # 'transformer' → V3, V4, V5
 
-    # Trajectory head hyperparameters (transformer decoder)
     gru_hidden         = get_nested(cfg, 'model', 'trajectory', 'gru_hidden',         default=64)
     num_heads          = get_nested(cfg, 'model', 'trajectory', 'num_heads',           default=8)
     num_decoder_layers = get_nested(cfg, 'model', 'trajectory', 'num_decoder_layers',  default=2)
@@ -131,30 +190,24 @@ if __name__ == '__main__':
     social_layers      = get_nested(cfg, 'model', 'trajectory', 'social_layers',       default=1)
     traj_dropout       = get_nested(cfg, 'model', 'trajectory', 'dropout',             default=0.1)
 
-    # Data
     TRAIN_DATA_DIR   = get_nested(cfg, 'data', 'train_dir',   default='')
+    VAL_DATA_DIR     = get_nested(cfg, 'data', 'val_dir',     default='')
     USE_FUTURE_TRAJ  = get_nested(cfg, 'data', 'future_traj', default=False)
 
-    # Parquet data
     PARQUET_TRAIN_DIR = get_nested(cfg, 'data', 'parquet_train_dir', default='')
+    PARQUET_VAL_DIR   = get_nested(cfg, 'data', 'parquet_val_dir',   default='')
 
-    # FIX: USE_PARQUET enabled for any model with parquet_train_dir set,
-    # regardless of decoder_type. This allows V3-traj (MLP decoder + parquet)
-    # to also use dual-dataset training.
     USE_PARQUET = bool(PARQUET_TRAIN_DIR)
 
-    # Training
     TRAIN_BATCH_SIZE = get_nested(cfg, 'training', 'batch_size',   default=8)
     NUM_EPOCHS       = get_nested(cfg, 'training', 'num_epochs',    default=10)
     NUM_WORKERS      = get_nested(cfg, 'training', 'num_workers',   default=0)
 
-    # Optimizer
     LR_BACKBONE  = get_nested(cfg, 'training', 'optimizer', 'lr_backbone', default=None)
     LR_HEADS     = get_nested(cfg, 'training', 'optimizer', 'lr_heads',    default=None)
     LR           = get_nested(cfg, 'training', 'optimizer', 'lr',          default=1e-4)
     WEIGHT_DECAY = get_nested(cfg, 'training', 'optimizer', 'weight_decay',default=1e-4)
 
-    # Loss
     USE_ROTATED_IOU  = get_nested(cfg, 'loss', 'use_rotated_iou',            default=False)
     APPLY_DOWNSAMPLE = get_nested(cfg, 'loss', 'apply_intention_downsampling',default=True)
     DOWNSAMPLE_RATIO = get_nested(
@@ -165,7 +218,6 @@ if __name__ == '__main__':
     INTENT_WEIGHT = get_nested(cfg, 'loss', 'intent_weight', default=0.5)
     TRAJ_LAMBDA   = get_nested(cfg, 'loss', 'traj_lambda',   default=TRAJECTORY_LAMBDA)
 
-    # Checkpoints
     MODEL_SAVE_DIR = get_nested(
         cfg, 'checkpoints', 'save_dir',
         default='/content/drive/MyDrive/Bachelor Thesis/Checkpoints'
@@ -282,7 +334,6 @@ if __name__ == '__main__':
 
     # =========================================================================
     # Sensor Dataset and DataLoader
-    # Same as V1/V2/V3 — used for detection + intention training
     # =========================================================================
     train_data_path = Path(TRAIN_DATA_DIR)
     if not train_data_path.is_dir():
@@ -311,8 +362,7 @@ if __name__ == '__main__':
         exit()
 
     # =========================================================================
-    # Parquet Dataset and DataLoader
-    # Used for trajectory training only
+    # Parquet Train Dataset and DataLoader
     # =========================================================================
     parquet_loader = None
     parquet_iter   = None
@@ -342,8 +392,6 @@ if __name__ == '__main__':
                 print("ERROR: Parquet DataLoader is empty.")
                 exit()
 
-            # How often to inject a parquet batch
-            # Target: parquet dataset completes ~1 pass per epoch
             n_sensor  = len(train_loader)
             n_parquet = len(parquet_loader)
             PARQUET_FREQ = max(1, n_sensor // n_parquet)
@@ -358,6 +406,42 @@ if __name__ == '__main__':
             exit()
 
     # =========================================================================
+    # NEW: Parquet Val Dataset and DataLoader
+    # Used for overfitting detection — val trajectory loss per epoch
+    # =========================================================================
+    parquet_val_loader = None
+
+    if USE_PARQUET and PARQUET_VAL_DIR and USE_TRAJECTORY:
+        parquet_val_path = Path(PARQUET_VAL_DIR)
+        if parquet_val_path.is_dir():
+            print("Initializing parquet val dataset for overfitting monitoring...")
+            try:
+                parquet_val_dataset = ParquetTrajectoryDataset(
+                    parquet_dir=PARQUET_VAL_DIR,
+                    sensor_dir=VAL_DATA_DIR,
+                    is_train=False,
+                )
+                parquet_val_loader = DataLoader(
+                    parquet_val_dataset,
+                    batch_size=1,
+                    shuffle=False,
+                    num_workers=0,
+                    collate_fn=parquet_collate_fn,
+                )
+                print(
+                    f"Parquet Val DataLoader: "
+                    f"{len(parquet_val_loader)} scenarios.\n"
+                )
+            except Exception as e:
+                print(f"WARNING: Could not load parquet val dataset: {e}")
+                parquet_val_loader = None
+        else:
+            print(
+                f"WARNING: parquet_val_dir not found: {PARQUET_VAL_DIR}. "
+                f"Overfitting monitoring disabled.\n"
+            )
+
+    # =========================================================================
     # Model
     # =========================================================================
     print("Initializing model...")
@@ -369,7 +453,6 @@ if __name__ == '__main__':
         trajectory_head_cfg=TRAJECTORY_HEAD_CFG,
     ).to(DEVICE)
 
-    # Load pretrained backbone if specified
     if PRETRAINED_CHECKPOINT and Path(PRETRAINED_CHECKPOINT).is_file():
         print(f"Loading pretrained backbone from: {PRETRAINED_CHECKPOINT}")
         model.load_pretrained_backbone(PRETRAINED_CHECKPOINT)
@@ -393,8 +476,6 @@ if __name__ == '__main__':
 
     # =========================================================================
     # Optimizer
-    # V4/V5: differential LR — lower for pretrained Swin backbone
-    # SOURCED: Howard & Ruder (ACL 2018) — discriminative fine-tuning
     # =========================================================================
     if LR_BACKBONE and LR_HEADS and backbone_type == 'swin':
         backbone_params = list(model.backbone.parameters())
@@ -414,7 +495,6 @@ if __name__ == '__main__':
         )
         print(f"Optimizer: AdamW lr={LR}")
 
-    # SOURCED: ReduceLROnPlateau — Nadeem thesis Section 3.4
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.1, patience=3
     )
@@ -432,7 +512,7 @@ if __name__ == '__main__':
     print(f"Anchors: {anchors.shape}\n")
 
     # =========================================================================
-    # Resume from checkpoint if specified
+    # Resume from checkpoint
     # =========================================================================
     RESUME_CHECKPOINT = get_nested(cfg, 'checkpoints', 'resume', default='')
     start_epoch = 0
@@ -450,6 +530,12 @@ if __name__ == '__main__':
         print("Starting from scratch.\n")
 
     # =========================================================================
+    # Overfitting tracking history
+    # =========================================================================
+    train_traj_history = []
+    val_traj_history   = []
+
+    # =========================================================================
     # Training loop
     # =========================================================================
     print(f"--- Starting Training [{MODEL_VERSION}] ---\n")
@@ -464,7 +550,6 @@ if __name__ == '__main__':
         epoch_traj_loss    = 0.0
         batches_done       = 0
 
-        # Reset parquet iterator each epoch
         if USE_PARQUET and parquet_loader is not None:
             parquet_iter = iter(parquet_loader)
 
@@ -484,12 +569,7 @@ if __name__ == '__main__':
 
             optimizer.zero_grad()
 
-            # =================================================================
-            # Single-dataset training path (no parquet)
-            # Used when parquet_train_dir is not set in config
-            # =================================================================
             if not USE_PARQUET:
-                # Standard forward pass — all heads run
                 outputs = model(
                     lidar_bev, map_bev,
                     gt_list=gt_list,
@@ -510,7 +590,6 @@ if __name__ == '__main__':
                     print(f"Warning: NaN in model output at batch {batch_idx+1}. Skipping.")
                     continue
 
-                # Extract trajectory GT from sensor annotations
                 gt_traj = None
                 gt_mask = None
                 if USE_TRAJECTORY and y_hat is not None:
@@ -518,7 +597,6 @@ if __name__ == '__main__':
                         gt_traj = gt_list[0]['future_traj_ego'].to(DEVICE)
                         gt_mask = gt_list[0]['future_traj_mask'].to(DEVICE)
 
-                # Combined loss
                 loss_dict = loss_fn(
                     cls_logits=det_cls_logits,
                     box_preds=det_box_preds,
@@ -532,14 +610,7 @@ if __name__ == '__main__':
                 )
                 loss = loss_dict["loss"]
 
-            # =================================================================
-            # Dual-dataset training path (with parquet)
-            # Used when parquet_train_dir is set in config
-            # Sensor batches: detection + intention every iteration
-            # Parquet batches: trajectory every PARQUET_FREQ iterations
-            # =================================================================
             else:
-                # --- Sensor batch: detection + intention only ---
                 sensor_outputs = model.forward_det_intent_only(
                     lidar_bev=lidar_bev,
                     map_bev=map_bev,
@@ -556,7 +627,6 @@ if __name__ == '__main__':
                     print(f"Warning: NaN in sensor outputs at batch {batch_idx+1}. Skipping.")
                     continue
 
-                # Detection + intention loss only
                 det_intent_loss_dict = loss_fn.det_intent_loss(
                     cls_logits=det_cls_logits,
                     box_preds=det_box_preds,
@@ -566,7 +636,6 @@ if __name__ == '__main__':
                 )
                 loss = det_intent_loss_dict["loss"]
 
-                # Build loss_dict for logging
                 loss_dict = {
                     "loss":            loss,
                     "cls_loss":        det_intent_loss_dict["cls_loss"],
@@ -576,14 +645,11 @@ if __name__ == '__main__':
                     "num_pos_anchors": det_intent_loss_dict["num_pos_anchors"],
                 }
 
-                # --- Parquet batch: trajectory only ---
-                # Injected every PARQUET_FREQ sensor batches
                 if (batch_idx % PARQUET_FREQ == 0 and
                         parquet_iter is not None):
                     try:
                         parquet_batch = next(parquet_iter)
                     except StopIteration:
-                        # Reset parquet iterator when exhausted
                         parquet_iter = iter(parquet_loader)
                         try:
                             parquet_batch = next(parquet_iter)
@@ -592,10 +658,8 @@ if __name__ == '__main__':
 
                     if parquet_batch is not None:
                         try:
-                            p_lidar = parquet_batch["lidar_bev"].to(DEVICE)
-                            p_map   = parquet_batch["map_bev"].to(DEVICE)
-
-                            # Get focal agent data for batch element 0
+                            p_lidar      = parquet_batch["lidar_bev"].to(DEVICE)
+                            p_map        = parquet_batch["map_bev"].to(DEVICE)
                             p_gt_boxes   = parquet_batch["gt_boxes"][0].to(DEVICE)
                             p_history    = parquet_batch["agent_history"][0].to(DEVICE)
                             p_traj_focal = parquet_batch["gt_traj_focal"][0].to(DEVICE)
@@ -603,7 +667,6 @@ if __name__ == '__main__':
                             p_focal_idx  = parquet_batch["focal_idx"][0]
 
                             if p_gt_boxes.shape[0] > 0:
-                                # Forward pass — trajectory head only
                                 parquet_outputs = model.forward_traj_only(
                                     lidar_bev=p_lidar,
                                     map_bev=p_map,
@@ -617,51 +680,31 @@ if __name__ == '__main__':
                                 if (y_hat_parquet is not None and
                                         y_hat_parquet.shape[1] > 0):
                                     if p_focal_idx < y_hat_parquet.shape[1]:
-                                        # Extract focal agent predictions only
-                                        # Training loss on focal agent only
-                                        # SOURCED: AV2 MF standard protocol
                                         y_hat_focal = y_hat_parquet[
                                             :, p_focal_idx:p_focal_idx+1, :, :
                                         ]
-                                        # [F, 1, 60, 4]
                                         pi_focal = pi_parquet[
                                             p_focal_idx:p_focal_idx+1, :
                                         ]
-                                        # [1, F]
-
                                         gt_traj_focal_batch = p_traj_focal.unsqueeze(0)
-                                        # [1, 60, 2] — ego frame
                                         gt_mask_focal_batch = p_mask_focal.unsqueeze(0)
-                                        # [1, 60]
-
-                                        # FIX: Transform GT from ego frame to agent-local frame
-                                        # before computing trajectory loss.
-                                        # SOURCED: Abdulbaki thesis Section 3.8
-                                        # Formula: R^T(p^t - p^T)
-                                        # where p^T = agent current position,
-                                        # R = rotation matrix from heading angle.
                                         focal_box = p_gt_boxes[
                                             p_focal_idx:p_focal_idx+1
                                         ]
-                                        # [1, 5]
-
                                         gt_traj_local = transform_to_agent_local(
-                                            gt_traj_focal_batch,  # [1, 60, 2] ego frame
-                                            focal_box             # [1, 5]
+                                            gt_traj_focal_batch,
+                                            focal_box
                                         )
-                                        # [1, 60, 2] agent-local frame
-
                                         traj_loss_out = loss_fn.traj_loss_fn(
                                             y_hat=y_hat_focal,
                                             pi=pi_focal,
-                                            gt_traj=gt_traj_local,  # agent-local
+                                            gt_traj=gt_traj_local,
                                             gt_mask=gt_mask_focal_batch,
                                         )
                                         traj_loss = traj_loss_out["loss"]
 
                                         if not (torch.isnan(traj_loss) or
                                                 torch.isinf(traj_loss)):
-                                            # Add weighted trajectory loss
                                             loss = loss + TRAJ_LAMBDA * traj_loss
                                             loss_dict["traj_loss"] = traj_loss.detach()
 
@@ -671,9 +714,6 @@ if __name__ == '__main__':
                                 f"batch {batch_idx}: {e}"
                             )
 
-            # =================================================================
-            # Backward pass — same for both training paths
-            # =================================================================
             if torch.isnan(loss):
                 print(f"Warning: NaN loss at batch {batch_idx+1}. Skipping.")
                 continue
@@ -681,7 +721,6 @@ if __name__ == '__main__':
             loss.backward()
             optimizer.step()
 
-            # Accumulate metrics
             epoch_loss        += loss.item()
             epoch_cls_loss    += loss_dict["cls_loss"].item()
             epoch_box_loss    += loss_dict["box_loss"].item()
@@ -692,7 +731,6 @@ if __name__ == '__main__':
             )
             batches_done += 1
 
-            # Progress bar
             postfix = {
                 'Loss': f"{loss.item():.4f}",
                 'Cls':  f"{loss_dict['cls_loss'].item():.3f}",
@@ -751,6 +789,51 @@ if __name__ == '__main__':
                 'config_path':          str(config_path),
             }, epoch_save_path)
             print(f"Checkpoint saved: {epoch_save_path}")
+
+            # =================================================================
+            # NEW: Val trajectory loss for overfitting detection
+            # =================================================================
+            if (USE_PARQUET and
+                    parquet_val_loader is not None and
+                    USE_TRAJECTORY and
+                    loss_fn.traj_loss_fn is not None):
+
+                print("Computing val trajectory loss...")
+                val_traj_loss = evaluate_val_traj_loss(
+                    model=model,
+                    parquet_val_loader=parquet_val_loader,
+                    loss_fn=loss_fn,
+                    device=DEVICE,
+                    decoder_type=decoder_type,
+                )
+
+                if val_traj_loss is not None:
+                    train_traj_history.append(avg_traj)
+                    val_traj_history.append(val_traj_loss)
+
+                    gap  = val_traj_loss - avg_traj
+                    flag = " ⚠️  OVERFITTING WARNING" if gap > 1.0 else ""
+
+                    print(
+                        f"  Train Traj Loss: {avg_traj:.4f} | "
+                        f"Val Traj Loss: {val_traj_loss:.4f} | "
+                        f"Gap: {gap:.4f}{flag}"
+                    )
+
+                    # Print full history table
+                    print("\n  Trajectory Loss History:")
+                    print(f"  {'Epoch':>5} | {'Train':>8} | {'Val':>8} | {'Gap':>8}")
+                    print(f"  {'-'*5}-+-{'-'*8}-+-{'-'*8}-+-{'-'*8}")
+                    for i, (tr, vl) in enumerate(
+                        zip(train_traj_history, val_traj_history)
+                    ):
+                        g    = vl - tr
+                        warn = " ⚠️" if g > 1.0 else ""
+                        print(
+                            f"  {i+1:>5} | {tr:>8.4f} | {vl:>8.4f} | "
+                            f"{g:>8.4f}{warn}"
+                        )
+                    print()
 
         else:
             print(f"Epoch {epoch+1}: No batches processed.")
