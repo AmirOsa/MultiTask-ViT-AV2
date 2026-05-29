@@ -75,6 +75,7 @@ class BEVTrajectoryDecoder(nn.Module):
         num_modes: int = TRAJECTORY_NUM_MODES,
         uncertain: bool = True,
         min_scale: float = TRAJECTORY_MIN_SCALE,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
 
@@ -95,6 +96,7 @@ class BEVTrajectoryDecoder(nn.Module):
             nn.Linear(feat_dim, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
         )
 
         # Aggregation MLP
@@ -102,6 +104,7 @@ class BEVTrajectoryDecoder(nn.Module):
             nn.Linear(hidden_size + hidden_size, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
         )
 
         # Location head
@@ -109,6 +112,7 @@ class BEVTrajectoryDecoder(nn.Module):
             nn.Linear(hidden_size, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
             nn.Linear(hidden_size, future_steps * 2),
         )
 
@@ -118,6 +122,7 @@ class BEVTrajectoryDecoder(nn.Module):
                 nn.Linear(hidden_size, hidden_size),
                 nn.LayerNorm(hidden_size),
                 nn.ReLU(inplace=True),
+                nn.Dropout(dropout),
                 nn.Linear(hidden_size, future_steps * 2),
             )
 
@@ -126,9 +131,11 @@ class BEVTrajectoryDecoder(nn.Module):
             nn.Linear(hidden_size + hidden_size, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
             nn.Linear(hidden_size, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
             nn.Linear(hidden_size, 1),
         )
 

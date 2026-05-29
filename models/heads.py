@@ -155,6 +155,7 @@ class TrajectoryHead(nn.Module):
         box_feat_dim: int = 4,
         # Only used for MLP decoder concatenation
         # 4 = (cx_m, cy_m, w_m, l_m)
+        mlp_dropout: float = 0.0,
 
         # Transformer decoder hyperparameters
         # All confirmed by 3-epoch ablation
@@ -231,6 +232,7 @@ class TrajectoryHead(nn.Module):
                 future_steps=TRAJECTORY_FUTURE_STEPS,
                 num_modes=TRAJECTORY_NUM_MODES,
                 min_scale=0.001,
+                dropout=mlp_dropout,
             )
             print(f"TrajectoryHead: MLP decoder (feat_dim={mlp_feat_dim})")
 

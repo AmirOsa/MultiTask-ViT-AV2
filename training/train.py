@@ -298,15 +298,21 @@ if __name__ == '__main__':
     # Trajectory head config
     # =========================================================================
     TRAJECTORY_HEAD_CFG = {}
-    if decoder_type == 'transformer':
+    if USE_TRAJECTORY:
         TRAJECTORY_HEAD_CFG = {
+            'mlp_dropout': get_nested(
+                cfg, 'model', 'trajectory', 'mlp_dropout', default=0.0
+            ),
+        }
+    if decoder_type == 'transformer':
+        TRAJECTORY_HEAD_CFG.update({
             'gru_hidden':         gru_hidden,
             'num_heads':          num_heads,
             'num_decoder_layers': num_decoder_layers,
             'social_heads':       social_heads,
             'social_layers':      social_layers,
             'dropout':            traj_dropout,
-        }
+        })
 
     # =========================================================================
     # Print configuration summary
