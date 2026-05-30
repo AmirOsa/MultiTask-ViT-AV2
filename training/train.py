@@ -611,18 +611,32 @@ if __name__ == '__main__':
                         N_min   = min(N_pred, N_gt)
 
                         if N_min > 0:
-                            # Filter out parked and stopped vehicles
-                            # from trajectory loss — focus on moving agents
+                            # ── Filter trajectory supervision to active agents ──
+                            # Step 1: Exclude explicitly parked vehicles
                             # SOURCED: IntentNet (Casas et al. 2018) —
                             # trajectory supervision applied only to
                             # dynamically active agents
                             intentions_min = gt_list[0]['intentions'].to(DEVICE)[:N_min]
-                            PARKED_CLASS           = 6
-                            STOPPING_STOPPED_CLASS = 5
-                            moving_mask = (
-                                (intentions_min != PARKED_CLASS) &
-                                (intentions_min != STOPPING_STOPPED_CLASS)
-                            )
+                            PARKED_CLASS = 6
+                            intent_mask = (intentions_min != PARKED_CLASS)
+
+                            # Step 2: Exclude barely-moving agents
+                            # Vehicles must move at least 0.5m over the
+                            # prediction horizon to contribute trajectory signal
+                            # This automatically excludes already-stopped vehicles
+                            # regardless of their intention label
+                            # SOURCED: DeTra velocity threshold for trajectory
+                            # supervision (Casas et al. 2024)
+                            MIN_DISPLACEMENT_M = 0.5
+                            traj_ego_min  = gt_traj_ego[:N_min]
+                            traj_mask_min = gt_mask[:N_min].float()
+                            displacements = (
+                                traj_ego_min.norm(dim=-1) * traj_mask_min
+                            ).max(dim=-1).values
+                            disp_mask = displacements > MIN_DISPLACEMENT_M
+
+                            # Combined filter
+                            moving_mask = intent_mask & disp_mask
 
                             if moving_mask.any():
                                 # Transform ego frame → agent-local frame
@@ -633,7 +647,7 @@ if __name__ == '__main__':
                                 )
                                 gt_mask = gt_mask[:N_min][moving_mask]
 
-                                # Filter y_hat and pi to moving agents only
+                                # Filter y_hat and pi to active agents only
                                 if y_hat is not None:
                                     y_hat = y_hat[:, :N_min][:, moving_mask]
                                 if pi is not None:

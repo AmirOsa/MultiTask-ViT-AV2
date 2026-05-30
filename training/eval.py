@@ -723,15 +723,26 @@ def main_eval():
                         N_eval = min(N_pred, N_gt)
 
                         if N_eval > 0:
-                            # Filter parked and stopped vehicles
+                            # ── Filter to active agents only ──
+                            # Step 1: Exclude explicitly parked vehicles
                             # SOURCED: IntentNet (Casas et al. 2018)
                             intentions_eval = gt_b0['intentions'].to(DEVICE)[:N_eval]
-                            PARKED_CLASS           = 6
-                            STOPPING_STOPPED_CLASS = 5
-                            moving_mask = (
-                                (intentions_eval != PARKED_CLASS) &
-                                (intentions_eval != STOPPING_STOPPED_CLASS)
-                            )
+                            PARKED_CLASS = 6
+                            intent_mask = (intentions_eval != PARKED_CLASS)
+
+                            # Step 2: Exclude barely-moving agents
+                            # Must move at least 0.5m over prediction horizon
+                            # Automatically catches already-stopped vehicles
+                            # SOURCED: DeTra velocity threshold (Casas et al. 2024)
+                            MIN_DISPLACEMENT_M = 0.5
+                            traj_ego_eval  = gt_traj[:N_eval]
+                            traj_mask_eval = gt_mask[:N_eval].float()
+                            displacements  = (
+                                traj_ego_eval.norm(dim=-1) * traj_mask_eval
+                            ).max(dim=-1).values
+                            disp_mask = displacements > MIN_DISPLACEMENT_M
+
+                            moving_mask = intent_mask & disp_mask
                             if not moving_mask.any():
                                 continue
 
