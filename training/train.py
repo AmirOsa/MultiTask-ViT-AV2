@@ -611,13 +611,33 @@ if __name__ == '__main__':
                         N_min   = min(N_pred, N_gt)
 
                         if N_min > 0:
-                            # Transform ego frame → agent-local frame
-                            # SOURCED: Abdulbaki thesis Section 3.8
-                            gt_traj = transform_to_agent_local(
-                                gt_traj_ego[:N_min],
-                                gt_boxes[:N_min]
+                            # Filter out parked and stopped vehicles
+                            # from trajectory loss — focus on moving agents
+                            # SOURCED: IntentNet (Casas et al. 2018) —
+                            # trajectory supervision applied only to
+                            # dynamically active agents
+                            intentions_min = gt_list[0]['intentions'].to(DEVICE)[:N_min]
+                            PARKED_CLASS           = 6
+                            STOPPING_STOPPED_CLASS = 5
+                            moving_mask = (
+                                (intentions_min != PARKED_CLASS) &
+                                (intentions_min != STOPPING_STOPPED_CLASS)
                             )
-                            gt_mask = gt_mask[:N_min]
+
+                            if moving_mask.any():
+                                # Transform ego frame → agent-local frame
+                                # SOURCED: Abdulbaki thesis Section 3.8
+                                gt_traj = transform_to_agent_local(
+                                    gt_traj_ego[:N_min][moving_mask],
+                                    gt_boxes[:N_min][moving_mask]
+                                )
+                                gt_mask = gt_mask[:N_min][moving_mask]
+
+                                # Filter y_hat and pi to moving agents only
+                                if y_hat is not None:
+                                    y_hat = y_hat[:, :N_min][:, moving_mask]
+                                if pi is not None:
+                                    pi = pi[:N_min][moving_mask]
 
                 loss_dict = loss_fn(
                     cls_logits=det_cls_logits,

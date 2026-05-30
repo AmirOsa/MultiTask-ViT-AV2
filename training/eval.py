@@ -723,7 +723,27 @@ def main_eval():
                         N_eval = min(N_pred, N_gt)
 
                         if N_eval > 0:
-                            gt_boxes_eval = gt_boxes[:N_eval]
+                            # Filter parked and stopped vehicles
+                            # SOURCED: IntentNet (Casas et al. 2018)
+                            intentions_eval = gt_b0['intentions'].to(DEVICE)[:N_eval]
+                            PARKED_CLASS           = 6
+                            STOPPING_STOPPED_CLASS = 5
+                            moving_mask = (
+                                (intentions_eval != PARKED_CLASS) &
+                                (intentions_eval != STOPPING_STOPPED_CLASS)
+                            )
+                            if not moving_mask.any():
+                                continue
+
+                            gt_traj  = gt_traj[:N_eval][moving_mask]
+                            gt_mask  = gt_mask[:N_eval][moving_mask]
+                            gt_boxes = gt_boxes[:N_eval][moving_mask]
+                            y_hat    = y_hat[:, :N_eval][:, moving_mask]
+                            if pi is not None:
+                                pi = pi[:N_eval][moving_mask]
+                            N_eval   = moving_mask.sum().item()
+
+                            gt_boxes_eval = gt_boxes
                             in_bev_mask = (
                                 (gt_boxes_eval[:, 0] >= BEV_X_MIN) &
                                 (gt_boxes_eval[:, 0] <= BEV_X_MAX) &
