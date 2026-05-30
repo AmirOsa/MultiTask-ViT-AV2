@@ -600,8 +600,23 @@ if __name__ == '__main__':
                 gt_mask = None
                 if USE_TRAJECTORY and y_hat is not None:
                     if gt_list[0] is not None and 'future_traj_ego' in gt_list[0]:
-                        gt_traj = gt_list[0]['future_traj_ego'].to(DEVICE)
-                        gt_mask = gt_list[0]['future_traj_mask'].to(DEVICE)
+                        gt_traj_ego = gt_list[0]['future_traj_ego'].to(DEVICE)
+                        gt_mask     = gt_list[0]['future_traj_mask'].to(DEVICE)
+                        gt_boxes    = gt_list[0]['boxes_xywha'].to(DEVICE)
+
+                        # Align N between trajectory GT and predicted trajectories
+                        N_pred  = y_hat.shape[1]
+                        N_gt    = gt_traj_ego.shape[0]
+                        N_min   = min(N_pred, N_gt)
+
+                        if N_min > 0:
+                            # Transform ego frame → agent-local frame
+                            # SOURCED: Abdulbaki thesis Section 3.8
+                            gt_traj = transform_to_agent_local(
+                                gt_traj_ego[:N_min],
+                                gt_boxes[:N_min]
+                            )
+                            gt_mask = gt_mask[:N_min]
 
                 loss_dict = loss_fn(
                     cls_logits=det_cls_logits,
