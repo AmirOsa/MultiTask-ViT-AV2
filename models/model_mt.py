@@ -460,14 +460,15 @@ class IntentNetViT_MT(nn.Module):
                     )
                     # [N, 2] — (col, row) on 50×90 feature map
 
-                    box_params_m = gt_boxes_b0[:, :4]
-                    # [N, 4] — (cx_m, cy_m, w_m, l_m)
+                    box_params_m = gt_boxes_b0[:, :5]
+                    # [N, 5] — (cx_m, cy_m, w_m, l_m, heading)
                     # Used by MLP decoder only — transformer decoder ignores
 
                     # Run trajectory head
                     # agent_history: None for MLP, [N,50,5] for transformer
                     y_hat, pi = self.traj_head(
                         feature_map=feature_map,
+                        map_bev=map_bev, 
                         box_centers_px=box_centers_px,
                         box_params_m=box_params_m,
                         agent_history=agent_history,

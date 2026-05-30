@@ -47,6 +47,8 @@ LIDAR_TOTAL_CHANNELS = LIDAR_HEIGHT_CHANNELS * LIDAR_SWEEPS
 
 MAP_CHANNELS = 9
 
+TRAJECTORY_MAP_CHANNELS = MAP_CHANNELS  # 9 — map BEV sampled at agent location for V3
+
 NUM_INTENTION_CLASSES = 8
 INTENTION_HORIZON_SECS = 3.0
 INTENTION_HORIZON_STEPS = int(INTENTION_HORIZON_SECS * 10)
@@ -86,7 +88,9 @@ VEHICLE_CATEGORIES = {
 # ─────────────────────────────────────────────────────────────────
 
 # SOURCED: Abdulbaki thesis Section 3.1 and Section 3.4.3
-TRAJECTORY_FUTURE_STEPS = 60       # 6 seconds × 10Hz
+TRAJECTORY_FUTURE_STEPS = 30       # 3 seconds × 10Hz
+                                   # Matches INTENTION_HORIZON_SECS = 3.0
+                                   # Consistent with IntentNet (Casas et al. 2018)
 
 # SOURCED: Abdulbaki thesis Section 3.4.3 + HiVT MLPDecoder code
 TRAJECTORY_NUM_MODES = 6           # 6 multimodal trajectory hypotheses
@@ -107,9 +111,9 @@ TRAJECTORY_DECODER_HIDDEN = 256
 # ─────────────────────────────────────────────────────────────────
 
 # SOURCED: Abdulbaki thesis Section 3.1
-AGENT_HISTORY_STEPS = 50           # 5 seconds × 10Hz
+AGENT_HISTORY_STEPS = 10           # 5 seconds × 10Hz
 
 # SOURCED: Abdulbaki thesis Section 3.6
 # f^t_i = [p^t_i, v^t_i, h^t_i] in R^5
 # position (x,y) + velocity (vx,vy) + heading (1) = 5 features
-AGENT_HISTORY_FEATURES = 5
+AGENT_HISTORY_FEATURES = 3

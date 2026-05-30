@@ -1,26 +1,32 @@
-# configs/v2_mlp.yaml
+# configs/v3_social_mlp.yaml
 #
-# IntentTrajNet-AV2 — V2 Configuration
-# Multi-task: detection + intention + MLP trajectory decoder
-# Same ViT backbone as V1 — isolates the effect of adding trajectory head
+# IntentTrajNet-AV2 — V3 Configuration
+# Multi-task: detection + intention + Social-Aware MLP trajectory decoder
+# Same ViT backbone as V1/V2 — isolates the effect of richer trajectory modeling
 #
 # Research question:
-#   Does adding trajectory prediction improve intention accuracy
-#   through shared backbone learning?
+#   Does adding social agent interaction context and explicit map awareness
+#   to the trajectory decoder further improve shared backbone representations
+#   and intention accuracy beyond V2's auxiliary MLP trajectory head?
+#
+# What's new vs V2:
+#   - Map BEV explicitly sampled at agent locations → [N, 9]
+#   - Social attention across N agents → agents attend to each other
+#   - Linear projection before attention → [N, 526] → [N, 256]
+#   SOURCED: DeTra object self-attention (Casas et al. 2024)
+#            HiVT global interaction module (Zhou et al. 2022)
 
 # ─────────────────────────────────────────────
 # Model
 # ─────────────────────────────────────────────
 model:
-  version: "V2"
+  version: "V3"
   use_trajectory: true
-  # True → TrajectoryHead created with MLP decoder (BEVTrajectoryDecoder)
 
   backbone:
     type: "vit"
-    # SOURCED: same as V1 — Nadeem thesis Section 3.3
-    # Keeping backbone identical to V1 isolates the contribution
-    # of the trajectory head to any performance difference
+    # Identical to V1 and V2 — backbone held constant across all versions
+    # SOURCED: Nadeem thesis Section 3.3
     vit_model_name_lidar: "vit_small_patch8_224"
     vit_model_name_map: "vit_small_patch8_224"
     pretrained_lidar: false
@@ -33,18 +39,23 @@ model:
     fusion_block_stride: 1
 
   trajectory:
-    decoder_type: "mlp"
-    # MLP decoder adapted from HiVT MLPDecoder
-    # SOURCED: Abdulbaki thesis Section 3.4.3
+    decoder_type: "social_mlp"
+    # Social + Map-Aware MLP decoder
+    # Pipeline: BEV[N,512] + Map[N,9] + BoxParams[N,5] → Linear(526→256)
+    #           → SocialAttention → BEVTrajectoryDecoder(MLP)
+    # SOURCED: DeTra object self-attention (Casas et al. 2024)
+    #          HiVT global interaction module (Zhou et al. 2022)
     future_steps: 30
-    # SOURCED: Abdulbaki thesis Section 3.1 — 6 seconds × 10Hz
+    # 3 seconds × 10Hz — matches intention horizon
+    # SOURCED: IntentNet (Casas et al. 2018)
     num_modes: 6
     # SOURCED: Abdulbaki thesis Section 3.4.3
     hidden_size: 256
-    # Confirmed by 1-epoch ablation over {128, 256, 512}.
-    # 256 gave lowest total loss (12.22) and best detection.
+    # SOURCED: V2 ablation confirmed 256
     min_scale: 0.001
     # SOURCED: HiVT decoder.py
+    mlp_dropout: 0.0
+    # No dropout — same as V2 for fair comparison
 
 # ─────────────────────────────────────────────
 # Data
@@ -53,11 +64,8 @@ data:
   train_dir: "/content/local_data/train"
   val_dir:   "/content/local_data/val"
   future_traj: true
-  # True → dataset loads future_traj_ego [N,60,2] and future_traj_mask [N,60]
-  # from annotations_with_intent.feather (precomputed city-frame GT)
+  # True → loads future_traj_ego [N,30,2] and future_traj_mask [N,30]
   gt_frame: "ego"
-  # Trajectory GT in ego frame — consistent with BEV representation
-  # SOURCED: consistent with prepare_gt_for_frame() in utils.py
 
 # ─────────────────────────────────────────────
 # Training
@@ -71,7 +79,7 @@ training:
     type: "AdamW"
     lr: 0.0001
     weight_decay: 0.0001
-    # SOURCED: Nadeem thesis Section 3.4 — same as V1 for fair comparison
+    # SOURCED: Nadeem thesis Section 3.4 — same as V1/V2 for fair comparison
 
   scheduler:
     type: "ReduceLROnPlateau"
@@ -92,18 +100,11 @@ loss:
   box_weight: 1.0
   cls_weight: 1.0
   intent_weight: 0.5
-  # SOURCED: Nadeem thesis Section 3.4 — unchanged from V1
+  # SOURCED: Nadeem thesis Section 3.4 — unchanged from V1/V2
 
   traj_lambda: 0.1
-  # Confirmed by 3-epoch ablation over {0.01, 0.1, 0.5, 1.0}.
-  # 0.1 gave best trajectory drop (53.3%) with stable detection/intention.
-  # Reference: Caruana (1997) multi-task learning — auxiliary tasks
-  # benefit primary task when properly weighted.
-
-  # Trajectory loss components
-  # SOURCED: Abdulbaki thesis Section 3.8
-  # L_traj = L_reg_WTA (Laplace NLL) + L_cls (cross-entropy on modes)
-  # L_total = L_det_intent + traj_lambda × L_traj
+  # Same as V2 — confirmed by V2 ablation over {0.01, 0.1, 0.5, 1.0}
+  # SOURCED: Caruana (1997) multi-task learning
 
 # ─────────────────────────────────────────────
 # Evaluation
@@ -112,25 +113,19 @@ eval:
   confidence_threshold: 0.1
   nms_iou_threshold: 0.2
   use_rotated_iou: false
-  use_rotated_nms: false        # NEW — NOT YET DECIDED 4
-  use_agent_local_traj: true    # NEW — transform traj to agent-local frame
+  use_rotated_nms: false
+  use_agent_local_traj: true
   batch_size: 8
 
   trajectory_metrics:
-    # All metric definitions SOURCED: Abdulbaki thesis Section 3.7
     miss_rate_threshold_m: 2.0
-    # SOURCED: Abdulbaki thesis — "endpoint exceeds 2.0 meters"
+    # SOURCED: Abdulbaki thesis Section 3.7
 
 # ─────────────────────────────────────────────
 # Checkpoints
 # ─────────────────────────────────────────────
 checkpoints:
   save_dir: "/content/drive/MyDrive/Bachelor Thesis/Checkpoints"
-  filename: "MultiTask_V2.pth"
-  resume: ""   #remove after finishing training
+  filename: "MultiTask_V3.pth"
+  resume: ""
   pretrained_v1: ""
-  # Optional: path to V1 checkpoint to initialise backbone weights
-  # Leaving empty → backbone trains from scratch (same as V1)
-  # Filling this → backbone starts from V1 pretrained weights,
-  # only trajectory head trains from scratch
-  # SOURCED: standard transfer learning practice

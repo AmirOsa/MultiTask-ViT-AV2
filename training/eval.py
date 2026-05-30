@@ -534,15 +534,20 @@ def main_eval():
 
     # Trajectory head config for transformer decoder
     traj_head_cfg = {}
-    if saved_decoder_type == 'transformer':
+    if use_trajectory:
         traj_head_cfg = {
+            'box_feat_dim': 5,  # cx, cy, w, l, heading
+            'mlp_dropout':  0.0,
+        }
+    if saved_decoder_type == 'transformer':
+        traj_head_cfg.update({
             'gru_hidden':         get_nested(cfg, 'model', 'trajectory', 'gru_hidden',         default=64),
             'num_heads':          get_nested(cfg, 'model', 'trajectory', 'num_heads',           default=8),
             'num_decoder_layers': get_nested(cfg, 'model', 'trajectory', 'num_decoder_layers',  default=2),
             'social_heads':       get_nested(cfg, 'model', 'trajectory', 'social_heads',        default=4),
             'social_layers':      get_nested(cfg, 'model', 'trajectory', 'social_layers',       default=1),
             'dropout':            get_nested(cfg, 'model', 'trajectory', 'dropout',             default=0.1),
-        }
+        })
 
     # Read backbone_type from checkpoint
     saved_backbone_type = checkpoint.get('backbone_cfg', {}).get('type', backbone_type)
@@ -645,7 +650,7 @@ def main_eval():
 
                 # For V4/V5: skip trajectory head in sensor eval
                 # Trajectory is evaluated separately via parquet protocol
-                run_traj = use_trajectory and (saved_decoder_type == 'mlp')
+                run_traj = use_trajectory and (saved_decoder_type in ('mlp', 'social_mlp'))
 
                 outputs = model(
                     lidar_bev, map_bev,

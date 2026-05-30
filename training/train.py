@@ -303,6 +303,7 @@ if __name__ == '__main__':
             'mlp_dropout': get_nested(
                 cfg, 'model', 'trajectory', 'mlp_dropout', default=0.0
             ),
+            'box_feat_dim': 5,  # ADD — cx, cy, w, l, heading
         }
     if decoder_type == 'transformer':
         TRAJECTORY_HEAD_CFG.update({
