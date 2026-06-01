@@ -127,5 +127,5 @@ eval:
 checkpoints:
   save_dir: "/content/drive/MyDrive/Bachelor Thesis/Checkpoints"
   filename: "MultiTask_V3.pth"
-  resume: ""
+  resume: "/content/drive/MyDrive/Bachelor Thesis/Checkpoints/MultiTask_V3_epoch3.pth"
   pretrained_v1: ""
