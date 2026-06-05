@@ -144,6 +144,22 @@ def compute_distance_binned_map(all_sample_results, iou_func,
 
         gt_dist = torch.sqrt(gt_boxes[:, 0]**2 + gt_boxes[:, 1]**2)
 
+        # ── Filter GT boxes to BEV bounds only ──
+        # Only evaluate vehicles the model was trained to detect
+        in_bev_mask = (
+            (gt_boxes[:, 0] >= BEV_X_MIN) &
+            (gt_boxes[:, 0] <= BEV_X_MAX) &
+            (gt_boxes[:, 1] >= BEV_Y_MIN) &
+            (gt_boxes[:, 1] <= BEV_Y_MAX)
+        )
+        gt_boxes = gt_boxes[in_bev_mask]
+        gt_dist  = gt_dist[in_bev_mask]
+        num_gt   = gt_boxes.shape[0]
+
+        if num_gt == 0:
+            continue
+        # ── End of filter ──
+
         for min_d, max_d, label in bins:
             bin_mask     = (gt_dist >= min_d) & (gt_dist < max_d)
             gt_boxes_bin = gt_boxes[bin_mask]
