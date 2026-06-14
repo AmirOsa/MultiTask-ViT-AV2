@@ -54,6 +54,7 @@
 #   run_traj_head=False skips trajectory for sensor batches.
 #   run_traj_head=True  runs trajectory for parquet batches.
 
+from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -358,6 +359,13 @@ class IntentNetViT_MT(nn.Module):
         # False → skip trajectory head (sensor batches in V4/V5 dual training)
         # Skipping trajectory head for sensor batches means det+intent losses
         # only update the backbone for those batches — correct behaviour.
+        # ── MODIFICATION 13: accepted but not used inside forward ──────────────
+        boxes_padded: torch.Tensor | None = None,
+        # [B, N_max, 5] — from collate_fn, not used directly in forward
+        # kept for API consistency with train.py call
+        agent_mask: torch.Tensor | None = None,
+        # [B, N_max] — from collate_fn, not used directly in forward
+        # train.py uses these for GT collection, model uses gt_list for sampling
     ) -> dict:
         """
         Forward pass — identical interface for all versions V1-V5.
@@ -440,50 +448,66 @@ class IntentNetViT_MT(nn.Module):
 
             if use_gt_boxes_for_traj and gt_list is not None:
                 # --- Teacher forcing: use GT box locations ---
-                # During training we use actual GT box centres to sample BEV
-                # features. This decouples trajectory learning from detection
-                # performance — avoids corrupted trajectory signal from bad
-                # detections in early training stages.
-                # SOURCED: DeTra (Casas et al., 2024) — standard practice.
+                # MODIFICATION 13: loop over all B scenes, sample from correct
+                # feature_map[b] per scene, run social attention within each scene.
+                # Previously only gt_list[0] was used — now all B scenes contribute.
+                # SOURCED: padding approach — HiVT, DeTra, Social-LSTM.
 
-                gt_boxes_b0 = (
-                    gt_list[0]['boxes_xywha'].to(device)
-                    if gt_list[0] is not None
-                    else torch.zeros(0, 5, device=device)
-                )
-                traj_gt_boxes = gt_boxes_b0
+                all_y_hat_list = []
+                all_pi_list    = []
+                all_boxes_list = []
 
-                if gt_boxes_b0.shape[0] > 0:
-                    # Convert GT box centres to feature map pixel coords
-                    box_centers_px = self._boxes_to_feature_map_pixels(
-                        gt_boxes_b0
-                    )
-                    # [N, 2] — (col, row) on 50×90 feature map
+                for b in range(B):
+                    gt_b = gt_list[b]
+                    if gt_b is None:
+                        continue
 
-                    box_params_m = gt_boxes_b0[:, :5]
-                    # [N, 5] — (cx_m, cy_m, w_m, l_m, heading)
-                    # Used by MLP decoder only — transformer decoder ignores
+                    boxes_b = gt_b['boxes_xywha'].to(device)  # [N_b, 5]
+                    if boxes_b.shape[0] == 0:
+                        continue
 
-                    # Run trajectory head
-                    # agent_history: None for MLP, [N,50,5] for transformer
-                    y_hat, pi = self.traj_head(
-                        feature_map=feature_map,
-                        map_bev=map_bev, 
+                    # Convert box centres to feature map pixel coords
+                    box_centers_px = self._boxes_to_feature_map_pixels(boxes_b)
+                    # [N_b, 2]
+
+                    box_params_m = boxes_b[:, :5]
+                    # [N_b, 5]
+
+                    # Sample from correct feature map slice for scene b
+                    # KEY FIX: each scene uses its own feature_map[b]
+                    # not feature_map[0] as in the original
+                    feature_map_b = feature_map[b:b+1]  # [1, 512, 50, 90]
+                    map_bev_b     = map_bev[b:b+1]      # [1, 9, 400, 720]
+
+                    # Run trajectory head for scene b only
+                    # Social attention runs within scene b — correct behaviour
+                    # Vehicles from different scenes do not attend to each other
+                    y_hat_b, pi_b = self.traj_head(
+                        feature_map=feature_map_b,
+                        map_bev=map_bev_b,
                         box_centers_px=box_centers_px,
                         box_params_m=box_params_m,
                         agent_history=agent_history,
-                        # None for V2/V3 (MLP decoder ignores it)
-                        # [N, 50, 5] for V4/V5 (transformer uses GRU encoder)
-                        use_gt_boxes=True
+                        use_gt_boxes=True,
                     )
-                    # y_hat: [F, N, 60, 4]
-                    # pi:    [N, F]
+                    # y_hat_b: [F, N_b, H, 4]
+                    # pi_b:    [N_b, F]
+
+                    all_y_hat_list.append(y_hat_b)
+                    all_pi_list.append(pi_b)
+                    all_boxes_list.append(boxes_b)
+
+                if all_y_hat_list:
+                    # Concatenate across all scenes
+                    y_hat         = torch.cat(all_y_hat_list, dim=1)  # [F, N_total, H, 4]
+                    pi            = torch.cat(all_pi_list,    dim=0)  # [N_total, F]
+                    traj_gt_boxes = torch.cat(all_boxes_list, dim=0)  # [N_total, 5]
                 else:
-                    # No GT boxes for this batch element — return empty tensors
                     F_modes = TRAJECTORY_NUM_MODES
-                    H = TRAJECTORY_FUTURE_STEPS
-                    y_hat = torch.zeros(F_modes, 0, H, 4, device=device)
-                    pi = torch.zeros(0, F_modes, device=device)
+                    H       = TRAJECTORY_FUTURE_STEPS
+                    y_hat         = torch.zeros(F_modes, 0, H, 4, device=device)
+                    pi            = torch.zeros(0, F_modes,       device=device)
+                    traj_gt_boxes = torch.zeros(0, 5,             device=device)
 
             else:
                 # --- Inference mode ---

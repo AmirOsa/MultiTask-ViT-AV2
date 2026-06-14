@@ -196,26 +196,79 @@ def collate_fn(batch: list) -> dict | None:
     Custom collate function to handle batches of data items.
     Filters out None items from failed __getitem__ calls.
 
-    GT stays as a list because N (number of vehicles) varies per frame.
-    Each element in gt_list is a dict with keys:
-        boxes_xywha      [N, 5]   — box coordinates in ego frame
-        intentions       [N]      — intention class per vehicle
-        track_ids        list     — vehicle ID strings
-        future_traj_ego  [N,60,2] — NEW: future positions in ego frame
-        future_traj_mask [N,60]   — NEW: True where position data is valid
+    GT stays as a list for detection/intention loss (unchanged from original).
+
+    MODIFICATION 13 — adds padded trajectory tensors alongside gt_list:
+        traj_padded:       [B, N_max, H, 2] — future positions, zero-padded
+        traj_mask_padded:  [B, N_max, H]    — True where position is valid
+        agent_mask:        [B, N_max]        — True for real vehicles, False for padding
+        boxes_padded:      [B, N_max, 5]    — GT boxes, zero-padded
+        intentions_padded: [B, N_max]        — intention labels, zero-padded
+
+    N_max = max vehicles across all B scenes in this batch.
+    Padded entries are zeroed and excluded from trajectory loss via agent_mask.
+
+    SOURCED: padding approach standard in HiVT, DeTra, Social-LSTM.
+    All multi-agent models handle variable N via padding + masking.
     """
     batch = [item for item in batch if item is not None]
     if not batch:
         return None
 
     lidar_bevs = torch.stack([item["lidar_bev"] for item in batch])
-    map_bevs = torch.stack([item["map_bev"] for item in batch])
-    gt_list = [item["gt"] for item in batch]
+    map_bevs   = torch.stack([item["map_bev"]   for item in batch])
+    gt_list    = [item["gt"] for item in batch]
+
+    # =========================================================================
+    # MODIFICATION 13: build padded trajectory tensors
+    # =========================================================================
+    B     = len(batch)
+    H     = TRAJECTORY_FUTURE_STEPS
+
+    # Find max vehicles across all scenes in this batch
+    N_max = max(
+        item["gt"]['boxes_xywha'].shape[0]
+        for item in batch
+    )
+    N_max = max(N_max, 1)  # avoid zero-size tensors
+
+    # Pre-allocate padded tensors — zeros everywhere
+    boxes_padded      = torch.zeros(B, N_max, 5,    dtype=torch.float32)
+    intentions_padded = torch.zeros(B, N_max,        dtype=torch.long)
+    traj_padded       = torch.zeros(B, N_max, H, 2, dtype=torch.float32)
+    traj_mask_padded  = torch.zeros(B, N_max, H,    dtype=torch.bool)
+    agent_mask        = torch.zeros(B, N_max,        dtype=torch.bool)
+    # agent_mask[b, n] = True  → real vehicle
+    # agent_mask[b, n] = False → padding, excluded from loss
+
+    for b, item in enumerate(batch):
+        gt  = item["gt"]
+        N_b = gt['boxes_xywha'].shape[0]
+
+        if N_b == 0:
+            continue
+
+        boxes_padded[b, :N_b]      = gt['boxes_xywha']
+        intentions_padded[b, :N_b] = gt['intentions']
+        agent_mask[b, :N_b]        = True
+
+        # Trajectory fields — only fill if present
+        if 'future_traj_ego' in gt:
+            traj_padded[b, :N_b]      = gt['future_traj_ego']
+            traj_mask_padded[b, :N_b] = gt['future_traj_mask']
 
     return {
-        "lidar_bev": lidar_bevs,
-        "map_bev": map_bevs,
-        "gt_list": gt_list
+        # ── Original fields — completely unchanged ──────────────────────────
+        "lidar_bev": lidar_bevs,   # [B, 290, 400, 720]
+        "map_bev":   map_bevs,     # [B,   9, 400, 720]
+        "gt_list":   gt_list,      # list of B dicts — for det/intent loss
+
+        # ── MODIFICATION 13: padded trajectory tensors ──────────────────────
+        "boxes_padded":      boxes_padded,       # [B, N_max, 5]
+        "intentions_padded": intentions_padded,  # [B, N_max]
+        "traj_padded":       traj_padded,        # [B, N_max, H, 2]
+        "traj_mask_padded":  traj_mask_padded,   # [B, N_max, H]
+        "agent_mask":        agent_mask,         # [B, N_max]
     }
 
 

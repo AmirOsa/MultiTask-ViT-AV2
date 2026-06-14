@@ -711,6 +711,8 @@ if __name__ == '__main__':
                     use_gt_boxes_for_traj=True,
                     agent_history=None,
                     run_traj_head=True,
+                    boxes_padded=batch_data["boxes_padded"].to(DEVICE) if "boxes_padded" in batch_data else None,
+                    agent_mask=batch_data["agent_mask"].to(DEVICE) if "agent_mask" in batch_data else None,
                 )
 
                 det_cls_logits   = outputs["det_cls_logits"]
@@ -729,34 +731,74 @@ if __name__ == '__main__':
                 gt_mask = None
                 if USE_TRAJECTORY and y_hat is not None:
                     # ==========================================================
-                    # MODIFICATION 13: collect GT from ALL B scenes
-                    # Previously: only gt_list[0] used → 922 scenes/epoch
-                    # Now: all B scenes → 7,375 scenes/epoch
+                    # MODIFICATION 13: full batch trajectory supervision
+                    # using padding and masking — standard literature approach
+                    # SOURCED: HiVT, DeTra, Social-LSTM
                     # ==========================================================
-                    gt_traj, gt_mask, _, N_total = collect_batch_trajectory_gt(
-                        gt_list, DEVICE, future_steps=TRAJECTORY_FUTURE_STEPS
-                    )
-                    # gt_traj: [N_total, H, 2] agent-local, all scenes combined
-                    # gt_mask: [N_total, H] validity mask
+                    gt_traj = None
+                    gt_mask = None
 
-                    if N_total == 0 or gt_traj is None:
-                        gt_traj = None
-                        gt_mask = None
-                    else:
-                        # Align N between y_hat predictions and GT
-                        N_pred = y_hat.shape[1]
-                        N_gt   = gt_traj.shape[0]
-                        N_min  = min(N_pred, N_gt)
+                    if "traj_padded" in batch_data:
+                        traj_padded      = batch_data["traj_padded"].to(DEVICE)      # [B, N_max, H, 2]
+                        traj_mask_padded = batch_data["traj_mask_padded"].to(DEVICE) # [B, N_max, H]
+                        agent_mask_batch = batch_data["agent_mask"].to(DEVICE)       # [B, N_max]
+                        boxes_padded_b   = batch_data["boxes_padded"].to(DEVICE)     # [B, N_max, 5]
+                        intentions_batch = batch_data["intentions_padded"].to(DEVICE)# [B, N_max]
 
-                        if N_min > 0:
-                            gt_traj = gt_traj[:N_min]
-                            gt_mask = gt_mask[:N_min]
-                            y_hat   = y_hat[:, :N_min]
-                            if pi is not None:
-                                pi = pi[:N_min]
-                        else:
-                            gt_traj = None
-                            gt_mask = None
+                        B_     = traj_padded.shape[0]
+                        N_max_ = traj_padded.shape[1]
+                        H_     = traj_padded.shape[2]
+
+                        # Flatten batch dimension
+                        traj_flat       = traj_padded.view(B_ * N_max_, H_, 2)
+                        traj_mask_flat  = traj_mask_padded.view(B_ * N_max_, H_)
+                        boxes_flat      = boxes_padded_b.view(B_ * N_max_, 5)
+                        intentions_flat = intentions_batch.view(B_ * N_max_)
+                        agent_mask_flat = agent_mask_batch.view(B_ * N_max_)
+
+                        # Keep only real vehicles — exclude padding
+                        traj_real       = traj_flat[agent_mask_flat]
+                        traj_mask_real  = traj_mask_flat[agent_mask_flat]
+                        boxes_real      = boxes_flat[agent_mask_flat]
+                        intentions_real = intentions_flat[agent_mask_flat]
+
+                        N_real = traj_real.shape[0]
+
+                        if N_real > 0:
+                            # Filter: exclude parked and barely-moving vehicles
+                            PARKED_CLASS       = 6
+                            MIN_DISPLACEMENT_M = 0.5
+
+                            intent_mask   = (intentions_real != PARKED_CLASS)
+                            displacements = (
+                                traj_real.norm(dim=-1) * traj_mask_real.float()
+                            ).max(dim=-1).values
+                            disp_mask   = displacements > MIN_DISPLACEMENT_M
+                            moving_mask = intent_mask & disp_mask
+
+                            if moving_mask.any():
+                                # Transform ego frame → agent-local frame
+                                # SOURCED: Abdulbaki thesis Section 3.8
+                                gt_traj = transform_to_agent_local(
+                                    traj_real[moving_mask],
+                                    boxes_real[moving_mask]
+                                )
+                                gt_mask = traj_mask_real[moving_mask]
+
+                                # Align N between y_hat and GT
+                                N_pred = y_hat.shape[1]
+                                N_gt   = gt_traj.shape[0]
+                                N_min  = min(N_pred, N_gt)
+
+                                if N_min > 0:
+                                    gt_traj = gt_traj[:N_min]
+                                    gt_mask = gt_mask[:N_min]
+                                    y_hat   = y_hat[:, :N_min]
+                                    if pi is not None:
+                                        pi = pi[:N_min]
+                                else:
+                                    gt_traj = None
+                                    gt_mask = None
 
                 loss_dict = loss_fn(
                     cls_logits=det_cls_logits,
