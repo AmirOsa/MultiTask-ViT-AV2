@@ -102,7 +102,7 @@ loss:
   intent_weight: 0.5
   # SOURCED: Nadeem thesis Section 3.4 — unchanged from V1/V2
 
-  traj_lambda: 0.1
+  traj_lambda: 0.0125
   # Same as V2 — confirmed by V2 ablation over {0.01, 0.1, 0.5, 1.0}
   # SOURCED: Caruana (1997) multi-task learning
 

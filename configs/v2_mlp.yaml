@@ -94,7 +94,7 @@ loss:
   intent_weight: 0.5
   # SOURCED: Nadeem thesis Section 3.4 — unchanged from V1
 
-  traj_lambda: 0.1
+  traj_lambda: 0.0125
   # Confirmed by 3-epoch ablation over {0.01, 0.1, 0.5, 1.0}.
   # 0.1 gave best trajectory drop (53.3%) with stable detection/intention.
   # Reference: Caruana (1997) multi-task learning — auxiliary tasks
