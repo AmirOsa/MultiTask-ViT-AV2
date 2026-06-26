@@ -6,6 +6,7 @@
 #    return aug_params dict — enables synchronised trajectory augmentation
 #    in av2_dataset.py. All augmentation logic is otherwise unchanged.
 
+from __future__ import annotations
 import torch
 import torchvision
 import numpy as np

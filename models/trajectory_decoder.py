@@ -23,6 +23,7 @@
 #   4. hidden_size changed from 64 → 256
 #   5. BUG FIX: renamed F → num_modes to avoid shadowing F.elu_()
 
+from __future__ import annotations
 from typing import Tuple
 import torch
 import torch.nn as nn

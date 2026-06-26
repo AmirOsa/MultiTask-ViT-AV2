@@ -19,6 +19,7 @@
 #   V1, V2: from models.backbone import TwoStreamViTBackbone
 #   V3:     from models.backbone import SwinBackbone
 
+from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

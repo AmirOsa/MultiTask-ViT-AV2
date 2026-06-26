@@ -2,6 +2,7 @@
 # Original repo: https://github.com/Nadeem202020/VisionTransformer-Intention-Prediction
 # Modifications: Added trajectory prediction constants at bottom of file
 
+from __future__ import annotations
 import numpy as np
 
 try:

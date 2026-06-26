@@ -24,6 +24,7 @@
 #   SOURCED: DeTra object self-attention (Casas et al. 2024)
 #            HiVT global interaction module (Zhou et al. 2022)
 
+from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
