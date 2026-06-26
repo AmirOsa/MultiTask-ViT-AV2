@@ -14,8 +14,8 @@ from __future__ import annotations
 #   5. Added trajectory loss logging for V2/V3
 #   6. Added trajectory GT extraction from gt_list
 #   7. Added differential learning rates for V3/V4/V5 (backbone vs heads)
-#   8. Added decoder_type reading from config (NEW for V4/V5)
-#   9. Added dual-dataset training loop (NEW for V4/V5):
+#   8. Added decoder_type reading from config (for V4/V5)
+#   9. Added dual-dataset training loop (for V4/V5):
 #      - Sensor dataloader: det+intent every iteration (922 batches/epoch)
 #      - Parquet dataloader: trajectory every ~70 iterations (13 batches/epoch)
 #      - Both update shared backbone simultaneously
@@ -26,13 +26,25 @@ from __future__ import annotations
 #      to detect overfitting early (train vs val gap tracking)
 #  13. MODIFICATION 13 — Full batch trajectory supervision fix:
 #      Previously only gt_list[0] contributed trajectory loss (922 scenes/epoch)
-#      Now all B scenes contribute via collect_batch_trajectory_gt() helper
-#      (7,375 scenes/epoch — same as detection and intention)
-#      Two new helper functions added before the training loop:
-#        collect_batch_boxes_for_forward() — collects boxes from all B scenes
-#        collect_batch_trajectory_gt()     — collects GT traj from all B scenes
-#      Only the trajectory supervision block inside the non-parquet path
-#      is changed. Everything else is identical to the original.
+#      Now all B scenes contribute via padding and masking (7,375 scenes/epoch)
+#      — same as detection and intention. Standard approach used in literature.
+#      Three changes: collate_fn in av2_dataset.py builds
+#      padded tensors [B, N_max, H, 2] with agent_mask [B, N_max]; model
+#      forward() loops over all B scenes; train.py uses padded tensors for GT.
+#
+#      NOTE FOR REPRODUCIBILITY:
+#      The results reported in the submitted thesis (June 2026) were produced
+#      with single-scene trajectory supervision (gt_list[0] only), giving the
+#      trajectory head 922 scenes/epoch vs 7,375 for detection and intention.
+#      Training with this implementation will produce different results:
+#        - Trajectory metrics (minADE, minFDE, MR) will improve
+#        - Detection/intention behaviour depends on decoder architecture
+#      To reproduce original thesis results exactly, replace the trajectory
+#      GT block below with:
+#        gt_traj_ego = gt_list[0]['future_traj_ego'].to(DEVICE)
+#        gt_mask     = gt_list[0]['future_traj_mask'].to(DEVICE)
+#        gt_boxes    = gt_list[0]['boxes_xywha'].to(DEVICE)
+#      and remove padded tensor keys from collate_fn in av2_dataset.py.
 
 import sys
 from pathlib import Path
@@ -64,7 +76,9 @@ from utils.utils import generate_anchors
 
 
 # =============================================================================
-# FIX: transform_to_agent_local
+# transform_to_agent_local
+# Transforms trajectory GT from ego frame to agent-local frame.
+# SOURCED: Abdulbaki thesis Section 3.8
 # =============================================================================
 def transform_to_agent_local(traj_ego, boxes_xywha):
     N       = traj_ego.shape[0]
@@ -82,7 +96,12 @@ def transform_to_agent_local(traj_ego, boxes_xywha):
 
 # =============================================================================
 # MODIFICATION 13: collect_batch_boxes_for_forward
-# NEW — collects GT boxes from ALL B scenes for model forward pass
+# RETAINED FOR REFERENCE — no longer called in training loop
+#
+# This was an intermediate implementation of full batch trajectory supervision
+# using concatenation across scenes. It has been superseded by the padding
+# and masking approach in collate_fn (av2_dataset.py) which is standard
+# in literature.
 # =============================================================================
 def collect_batch_boxes_for_forward(gt_list, device):
     """
@@ -120,7 +139,14 @@ def collect_batch_boxes_for_forward(gt_list, device):
 
 # =============================================================================
 # MODIFICATION 13: collect_batch_trajectory_gt
-# NEW — collects trajectory GT from ALL B scenes in batch
+# RETAINED FOR REFERENCE — no longer called in training loop
+#
+# This was an intermediate implementation of full batch trajectory supervision
+# using concatenation across scenes. It has been superseded by the padding
+# and masking approach in collate_fn (av2_dataset.py) which is standard
+# in literature. The padding and masking approach is implemented directly
+# in the training loop below using batch_data["traj_padded"] and
+# batch_data["agent_mask"].
 # =============================================================================
 def collect_batch_trajectory_gt(gt_list, device, future_steps=TRAJECTORY_FUTURE_STEPS):
     """
@@ -130,7 +156,7 @@ def collect_batch_trajectory_gt(gt_list, device, future_steps=TRAJECTORY_FUTURE_
     supervision than detection and intention. This function collects
     GT from all B scenes so every scene contributes every batch.
 
-    SOURCED: padding approach standard in HiVT, DeTra, Social-LSTM.
+    SOURCED: padding approach standard in literature.
 
     Returns:
         all_gt_traj_local: [N_total, H, 2] — agent-local trajectories, all scenes
@@ -199,7 +225,7 @@ def collect_batch_trajectory_gt(gt_list, device, future_steps=TRAJECTORY_FUTURE_
 
 
 # =============================================================================
-# NEW: evaluate_val_traj_loss
+# evaluate_val_traj_loss
 # Computes trajectory loss on parquet val set to detect overfitting.
 # Called at end of each epoch when USE_PARQUET is True.
 # =============================================================================
@@ -431,7 +457,7 @@ if __name__ == '__main__':
             'mlp_dropout': get_nested(
                 cfg, 'model', 'trajectory', 'mlp_dropout', default=0.0
             ),
-            'box_feat_dim': 5,  # ADD — cx, cy, w, l, heading
+            'box_feat_dim': 5,  # cx, cy, w, l, heading 
         }
     if decoder_type == 'transformer':
         TRAJECTORY_HEAD_CFG.update({
@@ -541,7 +567,7 @@ if __name__ == '__main__':
             exit()
 
     # =========================================================================
-    # NEW: Parquet Val Dataset and DataLoader
+    # Parquet Val Dataset and DataLoader
     # Used for overfitting detection — val trajectory loss per epoch
     # =========================================================================
     parquet_val_loader = None
@@ -732,8 +758,11 @@ if __name__ == '__main__':
                 if USE_TRAJECTORY and y_hat is not None:
                     # ==========================================================
                     # MODIFICATION 13: full batch trajectory supervision
-                    # using padding and masking — standard literature approach
-                    # SOURCED: HiVT, DeTra, Social-LSTM
+                    # using padding and masking — standard in literature
+                    #
+                    # NOTE FOR REPRODUCIBILITY: thesis results (June 2026) used
+                    # single-scene supervision (gt_list[0] only). See file header
+                    # for full reproducibility instructions.
                     # ==========================================================
                     gt_traj = None
                     gt_mask = None
@@ -994,7 +1023,7 @@ if __name__ == '__main__':
             print(f"Checkpoint saved: {epoch_save_path}")
 
             # =================================================================
-            # NEW: Val trajectory loss for overfitting detection
+            # Val trajectory loss for overfitting detection
             # =================================================================
             if (USE_PARQUET and
                     parquet_val_loader is not None and
