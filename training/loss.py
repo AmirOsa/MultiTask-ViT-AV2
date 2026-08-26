@@ -8,9 +8,8 @@
 #   2. DetectionIntentionLoss — completely unchanged from Nadeem's original
 #   3. Added TrajectoryLoss — new class implementing WTA Laplace NLL loss
 #      SOURCED: loss formulation from Abdulbaki thesis Section 3.8
-#   4. Added MultiTaskLoss — new wrapper combining all three losses
+#   4. Added MultiTaskLoss — wrapper combining all three losses
 #      L_total = L_det_intent + λ × L_trajectory
-#      NEEDS TEST: λ = TRAJECTORY_LAMBDA, ablation over {0.01, 0.1, 0.5, 1.0}
 
 import torch
 import torch.nn as nn
@@ -21,7 +20,7 @@ from torchvision.ops import sigmoid_focal_loss
 from utils.constants import (
     DOMINANT_CLASSES_FOR_DOWNSAMPLING,
     INTENTION_DOWNSAMPLE_RATIO,
-    TRAJECTORY_LAMBDA,          # NEEDS TEST: ablation {0.01, 0.1, 0.5, 1.0}
+    TRAJECTORY_LAMBDA,          
     TRAJECTORY_NUM_MODES,       # SOURCED: Abdulbaki thesis Section 3.4.3
     TRAJECTORY_FUTURE_STEPS,    # SOURCED: Abdulbaki thesis Section 3.1
 )
