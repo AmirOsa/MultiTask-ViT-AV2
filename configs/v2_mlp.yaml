@@ -111,10 +111,11 @@ loss:
 eval:
   confidence_threshold: 0.1
   nms_iou_threshold: 0.2
-  use_rotated_iou: false
-  use_rotated_nms: false        # NEW — NOT YET DECIDED 4
+  use_rotated_iou: true
+  use_rotated_nms: true        # NEW — NOT YET DECIDED 4
   use_agent_local_traj: true    # NEW — transform traj to agent-local frame
   batch_size: 8
+  save_results_path: "/content/drive/MyDrive/Amir_Dataset/EvalResults/v2_results.pt"   # NEW
 
   trajectory_metrics:
     # All metric definitions SOURCED: Abdulbaki thesis Section 3.7
@@ -125,9 +126,9 @@ eval:
 # Checkpoints
 # ─────────────────────────────────────────────
 checkpoints:
-  save_dir: "/content/drive/MyDrive/Bachelor Thesis/Checkpoints"
-  filename: "MultiTask_V2.pth"
-  resume: "/content/drive/MyDrive/Bachelor Thesis/Checkpoints/MultiTask_V2_epoch6.pth"   #remove after finishing training
+  save_dir: "/content/drive/MyDrive/Amir_Dataset/Checkpoints"
+  filename: "MultiTask_V2.pth"  
+  resume: "/content/drive/MyDrive/Amir_Dataset/Checkpoints/MultiTask_V2_epoch6.pth"   #remove after finishing training
   pretrained_v1: ""
   # Optional: path to V1 checkpoint to initialise backbone weights
   # Leaving empty → backbone trains from scratch (same as V1)

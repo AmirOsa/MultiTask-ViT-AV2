@@ -112,10 +112,11 @@ loss:
 eval:
   confidence_threshold: 0.1
   nms_iou_threshold: 0.2
-  use_rotated_iou: false
-  use_rotated_nms: false
+  use_rotated_iou: true
+  use_rotated_nms: true
   use_agent_local_traj: true
   batch_size: 8
+  save_results_path: "/content/drive/MyDrive/Amir_Dataset/EvalResults/v3_single_results.pt"   # NEW
 
   trajectory_metrics:
     miss_rate_threshold_m: 2.0
@@ -125,7 +126,7 @@ eval:
 # Checkpoints
 # ─────────────────────────────────────────────
 checkpoints:
-  save_dir: "/content/drive/MyDrive/Bachelor Thesis/Checkpoints"
+  save_dir: "/content/drive/MyDrive/Amir_Dataset/Checkpoints"
   filename: "MultiTask_V3.pth"
-  resume: "/content/drive/MyDrive/Bachelor Thesis/Checkpoints/MultiTask_V3_epoch9.pth"
+  resume: "/content/drive/MyDrive/Amir_Dataset/Checkpoints/MultiTask_V3_epoch9.pth"
   pretrained_v1: ""
