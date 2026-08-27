@@ -8,6 +8,26 @@
 #   Intention:   Accuracy, F1 macro, F1 weighted, F1 per class
 #   Trajectory:  minADE, minFDE, Miss Rate
 #
+# ## NEW — CHANGES FOR AIBThings 2026 REVISION (runtime optimization):
+#   compute_detection_ap() and compute_intention_metrics() now accept an
+#   optional `precomputed_iou_matrices` argument (default: None). When
+#   provided, the pred-vs-GT IoU matrix for each sample is looked up
+#   instead of being recomputed via iou_func(). This does NOT change any
+#   computed value — it eliminates redundant recomputation of the same
+#   IoU matrix, which previously happened independently inside
+#   compute_detection_ap (once per IoU threshold, ×5), compute_intention_metrics,
+#   compute_distance_binned_map (in eval.py), and the confusion-matrix
+#   block (in eval.py). When precomputed_iou_matrices is None (the
+#   default, used by any other caller), behavior is byte-for-byte
+#   identical to before this change.
+#
+#   A secondary fix within compute_detection_ap(): the IoU matrix is now
+#   computed at most once per sample even in the no-cache fallback path
+#   (previously it was recomputed once per IoU threshold — 5× redundant
+#   — despite the matrix not depending on the threshold at all, only the
+#   `>= iou_t` comparison does). This is a pure redundancy removal and
+#   does not change results.
+#
 # Trajectory metrics:
 #   SOURCED: minADE, minFDE, MR definitions from Abdulbaki thesis Section 3.7
 #   and AV2 benchmark specification (Wilson et al., 2023).
@@ -51,7 +71,7 @@ MISS_RATE_THRESHOLD_M = 2.0
 
 
 # =============================================================================
-# Trajectory metrics
+# Trajectory metrics — UNCHANGED
 # =============================================================================
 
 def compute_trajectory_metrics(
@@ -208,12 +228,15 @@ def accumulate_trajectory_metrics(
 
 # =============================================================================
 # Detection metrics
+# ## CHANGED — added optional precomputed_iou_matrices param + removed
+# redundant per-threshold IoU recomputation (see module header for details).
 # =============================================================================
 
 def compute_detection_ap(
     all_sample_results: list,
     iou_func,
     use_rotated_iou: bool = False,
+    precomputed_iou_matrices: list | None = None,   ## NEW
 ) -> dict:
     """
     Compute mAP at multiple IoU thresholds.
@@ -228,20 +251,47 @@ def compute_detection_ap(
             pred_boxes_xywha:  [M, 5] — predicted boxes
             gt_boxes_xywha:    [N, 5] — GT boxes
 
-        iou_func: IoU function (axis-aligned or rotated)
-        use_rotated_iou: bool
+        iou_func: IoU function (axis-aligned or rotated). Only used when
+            precomputed_iou_matrices is None.
+        use_rotated_iou: bool. Only used when precomputed_iou_matrices is None.
+        precomputed_iou_matrices: ## NEW — optional list, same length and
+            order as all_sample_results. Entry i is either a [num_pred_i,
+            num_gt_i] tensor of pred-vs-GT IoU values for sample i (in the
+            ORIGINAL, unsorted pred order matching sample['pred_boxes_xywha']),
+            or None if that sample has zero preds or zero GT boxes. When
+            provided, IoU is looked up instead of recomputed. When None
+            (default), behavior is identical to the original function.
 
     Returns:
         dict: mAP at each IoU threshold
     """
     ap_per_iou = {iou_t: [] for iou_t in DETECTION_IOU_THRESHOLDS}
 
-    for sample in all_sample_results:
+    for idx, sample in enumerate(all_sample_results):   ## CHANGED — enumerate for cache lookup
         pred_scores = sample['pred_scores']
         pred_boxes = sample['pred_boxes_xywha']
         gt_boxes = sample['gt_boxes_xywha']
         num_gt = gt_boxes.shape[0]
         num_pred = pred_boxes.shape[0]
+
+        # ## NEW — compute (or fetch) the full pred-vs-GT IoU matrix ONCE
+        # per sample, reused across all 5 IoU thresholds below. This
+        # matrix does not depend on the threshold — only the `>= iou_t`
+        # comparison does — so recomputing it per threshold (as the
+        # original code did) was pure redundant work with no effect on
+        # results. Fixed here regardless of whether a cache is supplied.
+        full_iou_matrix = None
+        if num_pred > 0 and num_gt > 0:
+            if precomputed_iou_matrices is not None:
+                full_iou_matrix = precomputed_iou_matrices[idx]
+            elif use_rotated_iou:
+                full_iou_matrix = iou_func(pred_boxes.float(), gt_boxes.float())
+            else:
+                full_iou_matrix = iou_func(
+                    pred_boxes[:, :4].float(), gt_boxes[:, :4].float()
+                )
+
+        sort_idx = torch.argsort(pred_scores, descending=True) if num_pred > 0 else None
 
         for iou_t in DETECTION_IOU_THRESHOLDS:
             if num_pred == 0:
@@ -251,18 +301,10 @@ def compute_detection_ap(
                 ap_per_iou[iou_t].append(0.0)
                 continue
 
-            sort_idx = torch.argsort(pred_scores, descending=True)
-            pred_boxes_sorted = pred_boxes[sort_idx]
-
-            if use_rotated_iou:
-                iou_matrix = iou_func(
-                    pred_boxes_sorted.float(), gt_boxes.float()
-                )
-            else:
-                iou_matrix = iou_func(
-                    pred_boxes_sorted[:, :4].float(),
-                    gt_boxes[:, :4].float()
-                )
+            # Reorder rows by score descending — same effect as the
+            # original code's pred_boxes_sorted-based matrix, just via
+            # indexing into the cached/full matrix instead of recomputing.
+            iou_matrix = full_iou_matrix[sort_idx]   ## CHANGED
 
             gt_matched = torch.zeros(num_gt, dtype=torch.bool)
             tp_flags = torch.zeros(num_pred, dtype=torch.bool)
@@ -292,12 +334,14 @@ def compute_detection_ap(
 
 # =============================================================================
 # Intention metrics
+# ## CHANGED — added optional precomputed_iou_matrices param
 # =============================================================================
 
 def compute_intention_metrics(
     all_sample_results: list,
     iou_func,
     use_rotated_iou: bool = False,
+    precomputed_iou_matrices: list | None = None,   ## NEW
 ) -> dict:
     """
     Compute intention prediction accuracy and F1 scores.
@@ -313,13 +357,16 @@ def compute_intention_metrics(
             gt_boxes_xywha:   [N, 5] — GT boxes
             gt_intentions:    [N] — GT intention class indices
 
+        precomputed_iou_matrices: ## NEW — same format/semantics as in
+            compute_detection_ap(). When provided, skips recomputing IoU.
+
     Returns:
         dict with accuracy, F1 macro, F1 weighted, F1 per class
     """
     matched_pred = []
     matched_gt = []
 
-    for sample in all_sample_results:
+    for idx, sample in enumerate(all_sample_results):   ## CHANGED — enumerate for cache lookup
         pred_scores = sample['pred_scores']
         pred_boxes = sample['pred_boxes_xywha']
         pred_intentions = sample['pred_intentions']
@@ -332,7 +379,9 @@ def compute_intention_metrics(
         if num_gt == 0 or num_pred == 0:
             continue
 
-        if use_rotated_iou:
+        if precomputed_iou_matrices is not None:   ## NEW
+            iou_matrix = precomputed_iou_matrices[idx]
+        elif use_rotated_iou:
             iou_matrix = iou_func(pred_boxes.float(), gt_boxes.float())
         else:
             iou_matrix = iou_func(

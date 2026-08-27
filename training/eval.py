@@ -8,18 +8,22 @@
 #
 # ## NEW ADDITIONS FOR REVIEWER RESPONSE (AIBThings 2026 revision):
 #  14. [NEW] End-to-end trajectory evaluation — samples trajectory features at
-#      post-NMS PREDICTED box centers instead of GT box centers, so reported
-#      metrics reflect real detection-to-trajectory error propagation rather
-#      than oracle-detection performance. Runs as an independent second pass
-#      over the val set; does not alter the existing teacher-forced (oracle)
-#      trajectory evaluation in any way.
-#  15. [NEW] Agent-density latency/memory sweep — benchmarks the trajectory
-#      head alone (not the full model) across a range of agent counts N,
-#      to isolate the cost of social attention as scene density grows.
-#  16. [NEW] Result-saving hook — optionally dumps per-sample detection,
-#      intention, and trajectory results to disk so bootstrap confidence
-#      intervals can be computed afterward by a separate script
-#      (utils/bootstrap_ci.py) without re-running inference.
+#      post-NMS PREDICTED box centers instead of GT box centers.
+#  15. [NEW] Agent-density latency/memory sweep (also available standalone
+#      via training/agent_density_benchmark.py).
+#  16. [NEW] Result-saving hook for bootstrap CI computation.
+#  17. [NEW] Pred-vs-GT IoU matrix caching — computed ONCE per sample in
+#      the main sensor loop, then reused by compute_detection_ap(),
+#      compute_intention_metrics(), compute_distance_binned_map(), and the
+#      confusion-matrix block, instead of each recomputing it independently
+#      (previously up to 5 redundant recomputations of the same matrix per
+#      sample when rotated IoU is enabled). This is a pure performance
+#      optimization — every reported value is byte-for-byte identical to
+#      the uncached version; see utils/metrics.py header for details.
+#      NOTE: this does NOT change NMS cost (rotated NMS is a separate,
+#      pred-vs-pred computation during suppression, not cacheable this way)
+#      or the end-to-end trajectory pass (which reruns detection on a
+#      fresh forward pass and does its own matching).
 
 import sys
 from pathlib import Path
@@ -42,9 +46,9 @@ from utils.constants import (
     NUM_INTENTION_CLASSES,
     BEV_X_MIN, BEV_X_MAX,
     BEV_Y_MIN, BEV_Y_MAX,
-    VOXEL_SIZE_M,               # NEW — needed for box->feature-map pixel conversion
-    BEV_PIXEL_OFFSET_X,         # NEW
-    BEV_PIXEL_OFFSET_Y,         # NEW
+    VOXEL_SIZE_M,
+    BEV_PIXEL_OFFSET_X,
+    BEV_PIXEL_OFFSET_Y,
 )
 from datasets.av2_dataset import ArgoverseIntentNetDataset, collate_fn
 from datasets.parquet_dataset import ParquetTrajectoryDataset, parquet_collate_fn
@@ -83,8 +87,7 @@ except ImportError:
 
 
 # =============================================================================
-# Agent-local frame transformation
-# SOURCED: Abdulbaki thesis Section 3.6
+# Agent-local frame transformation — UNCHANGED
 # =============================================================================
 
 def transform_to_agent_local(
@@ -113,10 +116,7 @@ def transform_to_agent_local(
 
 
 # =============================================================================
-# ## NEW — box-to-feature-map-pixel conversion
-# Standalone replica of IntentNetViT_MT._boxes_to_feature_map_pixels() so
-# eval.py can drive the trajectory head directly with PREDICTED boxes
-# without needing any change to model_mt.py.
+# Box-to-feature-map-pixel conversion — for end-to-end trajectory eval
 # =============================================================================
 
 def boxes_to_feature_map_pixels(
@@ -127,14 +127,6 @@ def boxes_to_feature_map_pixels(
     """
     Convert box centres (ego-frame metres) to feature map pixel coords.
     Identical formula to IntentNetViT_MT._boxes_to_feature_map_pixels().
-
-    Args:
-        boxes_xywha:   [N, 5] boxes (cx_m, cy_m, w, l, heading) in ego frame
-        feature_map_h: height of the backbone feature map (e.g. 50)
-        feature_map_w: width of the backbone feature map (e.g. 90)
-
-    Returns:
-        centers_px: [N, 2] — (col, row) on the feature map
     """
     if boxes_xywha.shape[0] == 0:
         return torch.zeros(0, 2, device=boxes_xywha.device)
@@ -153,9 +145,7 @@ def boxes_to_feature_map_pixels(
 
 
 # =============================================================================
-# ## NEW — greedy IoU matching, shared by end-to-end trajectory eval and
-# reused with the same semantics as the existing confusion-matrix matching
-# loop (one predicted box can match at most one GT box, highest score first).
+# Greedy IoU matching — for end-to-end trajectory eval
 # =============================================================================
 
 def greedy_match_predictions_to_gt(
@@ -212,11 +202,17 @@ def greedy_match_predictions_to_gt(
 
 # =============================================================================
 # Distance-binned mAP
-# (unchanged)
+# ## CHANGED — added optional precomputed_iou_matrices param, same
+# semantics as in utils/metrics.py. GT filtering (BEV bounds, distance
+# bins) now tracks original GT column indices so the cached full matrix
+# can be column-sliced instead of recomputing IoU on the filtered subset.
 # =============================================================================
 
-def compute_distance_binned_map(all_sample_results, iou_func,
-                                use_rotated, bins=None):
+def compute_distance_binned_map(
+    all_sample_results, iou_func,
+    use_rotated, bins=None,
+    precomputed_iou_matrices=None,   ## NEW
+):
     """Compute mAP@0.5 broken down by GT box distance from ego vehicle."""
     if bins is None:
         bins = [
@@ -228,7 +224,7 @@ def compute_distance_binned_map(all_sample_results, iou_func,
 
     results_per_bin = {label: [] for _, _, label in bins}
 
-    for sample in all_sample_results:
+    for idx, sample in enumerate(all_sample_results):   ## CHANGED — enumerate for cache lookup
         pred_scores = sample['pred_scores']
         pred_boxes  = sample['pred_boxes_xywha']
         gt_boxes    = sample['gt_boxes_xywha']
@@ -241,24 +237,37 @@ def compute_distance_binned_map(all_sample_results, iou_func,
         gt_dist = torch.sqrt(gt_boxes[:, 0]**2 + gt_boxes[:, 1]**2)
 
         # ── Filter GT boxes to BEV bounds only ──
+        # Only evaluate vehicles the model was trained to detect
         in_bev_mask = (
             (gt_boxes[:, 0] >= BEV_X_MIN) &
             (gt_boxes[:, 0] <= BEV_X_MAX) &
             (gt_boxes[:, 1] >= BEV_Y_MIN) &
             (gt_boxes[:, 1] <= BEV_Y_MAX)
         )
-        gt_boxes = gt_boxes[in_bev_mask]
-        gt_dist  = gt_dist[in_bev_mask]
-        num_gt   = gt_boxes.shape[0]
+
+        # ## NEW — track original GT column indices through both filters
+        # so the cached full matrix (in original GT order) can be sliced
+        # by column instead of recomputing IoU on the filtered subset.
+        orig_gt_idx = torch.arange(num_gt)
+
+        gt_boxes    = gt_boxes[in_bev_mask]
+        gt_dist     = gt_dist[in_bev_mask]
+        orig_gt_idx = orig_gt_idx[in_bev_mask]   ## NEW
+        num_gt      = gt_boxes.shape[0]
 
         if num_gt == 0:
             continue
         # ── End of filter ──
 
+        full_iou_matrix = None   ## NEW
+        if precomputed_iou_matrices is not None:
+            full_iou_matrix = precomputed_iou_matrices[idx]
+
         for min_d, max_d, label in bins:
-            bin_mask     = (gt_dist >= min_d) & (gt_dist < max_d)
-            gt_boxes_bin = gt_boxes[bin_mask]
-            num_gt_bin   = gt_boxes_bin.shape[0]
+            bin_mask        = (gt_dist >= min_d) & (gt_dist < max_d)
+            gt_boxes_bin     = gt_boxes[bin_mask]
+            orig_gt_idx_bin  = orig_gt_idx[bin_mask]   ## NEW
+            num_gt_bin       = gt_boxes_bin.shape[0]
 
             if num_gt_bin == 0:
                 continue
@@ -266,7 +275,13 @@ def compute_distance_binned_map(all_sample_results, iou_func,
                 results_per_bin[label].append(0.0)
                 continue
 
-            if use_rotated and ROTATED_IOU_AVAILABLE:
+            if full_iou_matrix is not None:   ## NEW
+                # Column-slice the cached full matrix by the same GT
+                # indices this bin selected — identical values to
+                # recomputing IoU on gt_boxes_bin, since IoU between a
+                # fixed pred/GT pair never changes.
+                iou_matrix = full_iou_matrix[:, orig_gt_idx_bin]
+            elif use_rotated and ROTATED_IOU_AVAILABLE:
                 iou_matrix = iou_func(pred_boxes.float(), gt_boxes_bin.float())
             else:
                 iou_matrix = iou_func(
@@ -301,7 +316,7 @@ def compute_distance_binned_map(all_sample_results, iou_func,
 
 
 # =============================================================================
-# Parquet trajectory evaluation — NEW for V4/V5 (unchanged)
+# Parquet trajectory evaluation — for V4/V5 — UNCHANGED
 # =============================================================================
 
 def evaluate_trajectory_parquet(
@@ -315,7 +330,7 @@ def evaluate_trajectory_parquet(
 ) -> dict:
     """
     Evaluate trajectory on parquet val scenarios.
-    (unchanged from original — see previous version for full docstring)
+    (unchanged)
     """
     print(f"\nEvaluating trajectory on parquet val scenarios...")
     print(f"  Parquet dir: {parquet_val_dir}")
@@ -503,18 +518,10 @@ def evaluate_trajectory_parquet(
 
 
 # =============================================================================
-# ## NEW — End-to-end (non-oracle) trajectory evaluation
-#
-# Runs as an INDEPENDENT second pass over the validation set. Detection is
-# run and NMS'd exactly as in the main sensor loop, predicted boxes are
-# matched to GT via IoU, and the trajectory head is queried directly at the
-# PREDICTED box locations/params (not GT). This measures real detection ->
-# trajectory error propagation instead of oracle-detection performance,
-# directly addressing R5's point that teacher-forced evaluation does not
-# reflect deployed behaviour.
-#
-# The existing oracle/teacher-forced trajectory evaluation inside the main
-# sensor loop is completely untouched by this function.
+# End-to-end (non-oracle) trajectory evaluation — UNCHANGED from previous
+# revision (this pass reruns detection fresh and does its own matching,
+# so it is intentionally NOT wired into the main-loop IoU cache — the
+# cache is scoped to the oracle/teacher-forced pass only).
 # =============================================================================
 
 def evaluate_trajectory_end_to_end(
@@ -532,11 +539,6 @@ def evaluate_trajectory_end_to_end(
     """
     Evaluate trajectory prediction using PREDICTED (post-NMS) box locations
     to sample the trajectory head, instead of ground-truth box centres.
-
-    Returns:
-        agg_metrics: dict — minADE / minFDE / MR / N_vehicles, aggregated
-        raw_results: list of per-batch dicts from compute_trajectory_metrics,
-                     kept for later bootstrap CI computation
     """
     print("\nRunning END-TO-END trajectory evaluation "
           "(predicted detections, not GT teacher forcing)...")
@@ -572,8 +574,6 @@ def evaluate_trajectory_end_to_end(
                 lidar_bev = batch_data["lidar_bev"].to(device, non_blocking=True)
                 map_bev   = batch_data["map_bev"].to(device, non_blocking=True)
 
-                # Detection + intention only — trajectory head is queried
-                # manually below at predicted box locations.
                 outputs = model(
                     lidar_bev, map_bev,
                     gt_list=None,
@@ -584,14 +584,13 @@ def evaluate_trajectory_end_to_end(
 
                 det_cls_logits = outputs["det_cls_logits"]
                 det_box_preds  = outputs["det_box_preds"]
-                feature_map    = outputs["feature_map"]  # [B, 512, 50, 90]
+                feature_map    = outputs["feature_map"]
 
                 for b_idx in range(batch_size):
                     gt_b = gt_list_cpu[b_idx]
                     if gt_b is None or gt_b['boxes_xywha'].shape[0] == 0:
                         continue
 
-                    # --- Decode + NMS predicted boxes for this scene ---
                     cls_s = det_cls_logits[b_idx]
                     box_s = det_box_preds[b_idx]
                     scores = torch.sigmoid(cls_s)
@@ -614,10 +613,9 @@ def evaluate_trajectory_end_to_end(
                     if nms_keep.numel() == 0:
                         continue
 
-                    pred_boxes  = boxes_abs[nms_keep]       # [M, 5]
-                    pred_scores = sc_f[nms_keep]            # [M]
+                    pred_boxes  = boxes_abs[nms_keep]
+                    pred_scores = sc_f[nms_keep]
 
-                    # --- Match predicted boxes to GT boxes ---
                     gt_boxes      = gt_b['boxes_xywha'].to(device)
                     gt_intentions = gt_b['intentions'].to(device)
 
@@ -631,9 +629,6 @@ def evaluate_trajectory_end_to_end(
                     matched_pred_idx = matched_pred_idx.to(device)
                     matched_gt_idx   = matched_gt_idx.to(device)
 
-                    # --- Active-agent filter, applied on the GT side ---
-                    # (same filter used for training/oracle eval, so results
-                    # are directly comparable)
                     if 'future_traj_ego' not in gt_b:
                         continue
 
@@ -658,7 +653,6 @@ def evaluate_trajectory_end_to_end(
                     final_gt_traj    = gt_traj_matched[active_mask]
                     final_gt_mask    = gt_mask_matched[active_mask]
 
-                    # --- Query trajectory head directly at PREDICTED boxes ---
                     pred_centers_px = boxes_to_feature_map_pixels(
                         final_pred_boxes, feature_map_h, feature_map_w
                     )
@@ -670,19 +664,10 @@ def evaluate_trajectory_end_to_end(
                         box_params_m=final_pred_boxes,
                         use_gt_boxes=False,
                     )
-                    # y_hat: [F, N_active, H, 4] — already relative to the
-                    # PREDICTED box params fed in above (the decoder was
-                    # trained to output positions relative to whatever box
-                    # params it is given), so no further frame transform is
-                    # applied to y_hat itself.
 
                     if y_hat is None or y_hat.shape[1] == 0:
                         continue
 
-                    # --- Transform GT into the PREDICTED box's frame ---
-                    # This is the step that captures error propagation from
-                    # detection localisation/heading error into trajectory
-                    # error — we deliberately do NOT use the GT box here.
                     if use_agent_local_traj:
                         gt_traj_eval = transform_to_agent_local(
                             final_gt_traj, final_pred_boxes
@@ -718,12 +703,7 @@ def evaluate_trajectory_end_to_end(
 
 
 # =============================================================================
-# ## NEW — Agent-density latency / memory benchmark
-#
-# Benchmarks the TRAJECTORY HEAD ALONE (fixed backbone feature map) across
-# a range of agent counts N, to isolate the cost of social attention (V3)
-# as scene density grows — directly addressing R3's point that identical
-# reported MACs/latency for the full model do not isolate this cost.
+# Agent-density latency / memory benchmark — UNCHANGED
 # =============================================================================
 
 def benchmark_trajectory_head_by_agent_count(
@@ -734,12 +714,7 @@ def benchmark_trajectory_head_by_agent_count(
     num_trials: int = 30,
 ) -> dict:
     """
-    Times model.traj_head forward passes for increasing numbers of agents N,
-    holding the backbone feature map fixed (randomly initialised, same
-    across all N). Reports latency and peak CUDA memory per N.
-
-    Returns:
-        dict mapping N -> {'latency_ms_mean', 'latency_ms_std', 'peak_mem_mb'}
+    Times model.traj_head forward passes for increasing numbers of agents N.
     """
     if getattr(model, 'traj_head', None) is None:
         print("Model has no trajectory head — skipping agent-density benchmark.")
@@ -772,13 +747,12 @@ def benchmark_trajectory_head_by_agent_count(
             ], dim=-1)
 
             dummy_box_params = torch.zeros(N, 5, device=device)
-            dummy_box_params[:, 0] = torch.rand(N, device=device) * 40 - 10  # cx
-            dummy_box_params[:, 1] = torch.rand(N, device=device) * 40 - 20  # cy
-            dummy_box_params[:, 2] = 2.0   # w
-            dummy_box_params[:, 3] = 4.5   # l
-            dummy_box_params[:, 4] = torch.rand(N, device=device) * 3.14 - 1.57  # heading
+            dummy_box_params[:, 0] = torch.rand(N, device=device) * 40 - 10
+            dummy_box_params[:, 1] = torch.rand(N, device=device) * 40 - 20
+            dummy_box_params[:, 2] = 2.0
+            dummy_box_params[:, 3] = 4.5
+            dummy_box_params[:, 4] = torch.rand(N, device=device) * 3.14 - 1.57
 
-            # Warmup
             for _ in range(num_warmup):
                 model.traj_head(
                     feature_map=dummy_feature_map,
@@ -832,15 +806,9 @@ def benchmark_trajectory_head_by_agent_count(
 def main_eval():
     """Main evaluation function for IntentTrajNet-AV2."""
 
-    # =========================================================================
-    # Load config
-    # =========================================================================
     config_path = get_config_arg()
     cfg = load_config(config_path)
 
-    # =========================================================================
-    # Read settings from config
-    # =========================================================================
     MODEL_VERSION  = get_nested(cfg, 'model', 'version', default='V2')
     USE_TRAJECTORY = get_nested(cfg, 'model', 'use_trajectory', default=False)
     backbone_type  = get_nested(cfg, 'model', 'backbone', 'type', default='vit')
@@ -848,15 +816,11 @@ def main_eval():
 
     VAL_DATA_DIR = get_nested(cfg, 'data', 'val_dir', default='')
 
-    # Parquet eval settings — for V4/V5
     PARQUET_VAL_DIR     = get_nested(cfg, 'data', 'parquet_val_dir',  default='')
     EVAL_FOCAL_ONLY     = get_nested(cfg, 'eval', 'eval_focal_only',  default=False)
     EVAL_ALL_AGENTS     = get_nested(cfg, 'eval', 'eval_all_agents',  default=False)
     USE_PARQUET_EVAL    = bool(PARQUET_VAL_DIR) and (EVAL_FOCAL_ONLY or EVAL_ALL_AGENTS)
 
-    # ── NEW eval config flags — all default to sensible values so existing
-    #    configs (without these keys) still run, just with the new analyses
-    #    enabled by default since that's what this revision needs. ──
     EVAL_END_TO_END_TRAJ    = get_nested(cfg, 'eval', 'eval_end_to_end_traj',    default=True)
     BENCHMARK_AGENT_DENSITY = get_nested(cfg, 'eval', 'benchmark_agent_density', default=True)
     SAVE_RESULTS_PATH       = get_nested(cfg, 'eval', 'save_results_path',      default='')
@@ -904,14 +868,12 @@ def main_eval():
     print(f"  Rotated IoU (mAP):     {EVAL_USE_ROTATED_IOU}")
     print(f"  Rotated NMS:           {EVAL_USE_ROTATED_NMS}")
     print(f"  Agent-local traj:      {EVAL_USE_AGENT_LOCAL_TRAJ}")
-    print(f"  End-to-end traj eval:  {EVAL_END_TO_END_TRAJ}")          # NEW
-    print(f"  Agent-density bench:   {BENCHMARK_AGENT_DENSITY}")       # NEW
-    print(f"  Save results to:       {SAVE_RESULTS_PATH or '(disabled)'}")  # NEW
+    print(f"  End-to-end traj eval:  {EVAL_END_TO_END_TRAJ}")
+    print(f"  Agent-density bench:   {BENCHMARK_AGENT_DENSITY}")
+    print(f"  Save results to:       {SAVE_RESULTS_PATH or '(disabled)'}")
+    print(f"  IoU matrix caching:    ENABLED (perf optimization)")   ## NEW
     print(f"{'='*60}\n")
 
-    # =========================================================================
-    # Load checkpoint
-    # =========================================================================
     checkpoint_path = Path(CHECKPOINT_PATH)
     if not checkpoint_path.is_file():
         print(f"ERROR: Checkpoint not found: {CHECKPOINT_PATH}")
@@ -927,9 +889,6 @@ def main_eval():
         print(f"ERROR loading checkpoint: {e}")
         return
 
-    # =========================================================================
-    # Model — read decoder_type from checkpoint for correct init
-    # =========================================================================
     saved_backbone_cfg = checkpoint.get('backbone_cfg', {})
     use_trajectory     = checkpoint.get('use_trajectory', USE_TRAJECTORY)
     saved_decoder_type = checkpoint.get('decoder_type', decoder_type)
@@ -978,9 +937,6 @@ def main_eval():
         print(f"ERROR instantiating model: {e}")
         return
 
-    # =========================================================================
-    # Sensor Dataset — detection + intention + auxiliary trajectory eval
-    # =========================================================================
     val_data_path = Path(VAL_DATA_DIR)
     if not val_data_path.is_dir():
         print(f"ERROR: Val data not found: {VAL_DATA_DIR}")
@@ -1004,9 +960,6 @@ def main_eval():
         print(f"ERROR initializing sensor val dataset: {e}")
         return
 
-    # =========================================================================
-    # Anchors
-    # =========================================================================
     print("Generating anchors...")
     if backbone_type == 'swin':
         FEATURE_MAP_STRIDE = 8
@@ -1038,11 +991,19 @@ def main_eval():
 
     # =========================================================================
     # Sensor inference loop — detection + intention + auxiliary (oracle)
-    # trajectory. UNCHANGED from original.
+    # trajectory. ## CHANGED: now also builds all_cached_iou_matrices,
+    # computing each sample's pred-vs-GT IoU matrix exactly once, reused
+    # by every metric function below instead of being recomputed per call.
     # =========================================================================
     print("Running sensor inference...")
-    all_sample_results      = []
-    all_traj_metric_results = []
+    all_sample_results       = []
+    all_traj_metric_results  = []
+    all_cached_iou_matrices  = []   ## NEW — one entry per sample, aligned
+                                     # 1:1 with all_sample_results by index
+    run_traj = False   ## FIX — safe default so this variable always exists
+                        # even if every batch is skipped/None (e.g. missing
+                        # precomputed intent files), preventing the
+                        # UnboundLocalError seen previously.
 
     with torch.inference_mode():
         pbar = tqdm(val_loader, desc=f"Sensor Eval [{MODEL_VERSION}]", unit="batch")
@@ -1112,11 +1073,32 @@ def main_eval():
                         print(f"Error post-processing b_idx={b_idx}: {e}")
 
                     gt = gt_list_cpu[b_idx]
+                    sample_gt_boxes = gt.get('boxes_xywha', torch.empty((0, 5)))   ## NEW
                     all_sample_results.append({
                         **sample_pred,
-                        'gt_boxes_xywha': gt.get('boxes_xywha', torch.empty((0, 5))),
+                        'gt_boxes_xywha': sample_gt_boxes,
                         'gt_intentions':  gt.get('intentions',  torch.empty(0, dtype=torch.long))
                     })
+
+                    # ## NEW — compute the pred-vs-GT IoU matrix for this
+                    # sample exactly once, here, and cache it. Every
+                    # downstream metric function (mAP, intention matching,
+                    # distance-binned mAP, confusion matrix) will reuse
+                    # this instead of recomputing it independently.
+                    pred_boxes_s = sample_pred['pred_boxes_xywha']
+                    if pred_boxes_s.shape[0] > 0 and sample_gt_boxes.shape[0] > 0:
+                        if EVAL_USE_ROTATED_IOU and ROTATED_IOU_AVAILABLE:
+                            cached_matrix = iou_func(
+                                pred_boxes_s.float(), sample_gt_boxes.float()
+                            )
+                        else:
+                            cached_matrix = iou_func(
+                                pred_boxes_s[:, :4].float(),
+                                sample_gt_boxes[:, :4].float()
+                            )
+                    else:
+                        cached_matrix = None
+                    all_cached_iou_matrices.append(cached_matrix)
 
                 # Auxiliary (oracle) trajectory metrics — UNCHANGED
                 if run_traj and y_hat is not None:
@@ -1201,16 +1183,20 @@ def main_eval():
     print(f"\nCollected {len(all_sample_results)} sample results.")
 
     # =========================================================================
-    # Compute and print sensor metrics — UNCHANGED
+    # Compute and print sensor metrics
+    # ## CHANGED — now passes all_cached_iou_matrices through so IoU is
+    # not recomputed by these functions.
     # =========================================================================
     print("\nComputing detection mAP...")
     det_metrics = compute_detection_ap(
-        all_sample_results, iou_func, EVAL_USE_ROTATED_IOU
+        all_sample_results, iou_func, EVAL_USE_ROTATED_IOU,
+        precomputed_iou_matrices=all_cached_iou_matrices,   ## NEW
     )
 
     print("Computing intention metrics...")
     intent_metrics = compute_intention_metrics(
-        all_sample_results, iou_func, EVAL_USE_ROTATED_IOU
+        all_sample_results, iou_func, EVAL_USE_ROTATED_IOU,
+        precomputed_iou_matrices=all_cached_iou_matrices,   ## NEW
     )
 
     traj_metrics = {}
@@ -1227,23 +1213,24 @@ def main_eval():
               f"teacher-forced/oracle detections)")
 
     # =========================================================================
-    # Distance-binned mAP — UNCHANGED
+    # Distance-binned mAP — ## CHANGED — passes cache through
     # =========================================================================
     print("\nDistance-binned mAP@0.5:")
     try:
         dist_map = compute_distance_binned_map(
-            all_sample_results, iou_func, EVAL_USE_ROTATED_IOU
+            all_sample_results, iou_func, EVAL_USE_ROTATED_IOU,
+            precomputed_iou_matrices=all_cached_iou_matrices,   ## NEW
         )
         for label, ap in dist_map.items():
             print(f"  mAP@0.5 {label:<10}: {ap:.4f}")
-        all_metrics['distance_binned_mAP'] = dist_map   # NEW — kept for saving
+        all_metrics['distance_binned_mAP'] = dist_map
     except Exception as e:
         print(f"  Distance-binned mAP failed: {e}")
 
     # =========================================================================
-    # Intention confusion matrix — UNCHANGED
+    # Intention confusion matrix — ## CHANGED — uses cached matrix
     # =========================================================================
-    confusion_matrix_result = None   # NEW — captured for saving
+    confusion_matrix_result = None
     if SKLEARN_AVAILABLE:
         print("\nIntention Confusion Matrix (rows=GT, cols=Predicted):")
         try:
@@ -1251,7 +1238,7 @@ def main_eval():
             matched_pred_all = []
             matched_gt_all   = []
 
-            for sample in all_sample_results:
+            for idx, sample in enumerate(all_sample_results):   ## CHANGED — enumerate for cache lookup
                 pred_scores  = sample['pred_scores']
                 pred_boxes   = sample['pred_boxes_xywha']
                 pred_intents = sample['pred_intentions']
@@ -1261,12 +1248,9 @@ def main_eval():
                 if pred_boxes.shape[0] == 0 or gt_boxes.shape[0] == 0:
                     continue
 
-                if EVAL_USE_ROTATED_IOU and ROTATED_IOU_AVAILABLE:
-                    iou_mat = iou_func(pred_boxes.float(), gt_boxes.float())
-                else:
-                    iou_mat = iou_func(
-                        pred_boxes[:, :4].float(), gt_boxes[:, :4].float()
-                    )
+                iou_mat = all_cached_iou_matrices[idx]   ## CHANGED — was: recomputed via iou_func here
+                if iou_mat is None:
+                    continue
 
                 gt_matched = torch.zeros(gt_boxes.shape[0], dtype=torch.bool)
                 sort_idx   = torch.argsort(pred_scores, descending=True)
@@ -1288,7 +1272,7 @@ def main_eval():
                     matched_gt_all, matched_pred_all,
                     labels=list(range(NUM_INTENTION_CLASSES))
                 )
-                confusion_matrix_result = cm   # NEW
+                confusion_matrix_result = cm
                 class_names = [
                     INTENTIONS_MAP_REV.get(i, f'C{i}')[:8]
                     for i in range(NUM_INTENTION_CLASSES)
@@ -1302,8 +1286,7 @@ def main_eval():
             print(f"  Confusion matrix failed: {e}")
 
     # =========================================================================
-    # ## NEW — End-to-end (non-oracle) trajectory evaluation
-    # Independent second pass over val_loader. See function docstring above.
+    # End-to-end (non-oracle) trajectory evaluation — UNCHANGED
     # =========================================================================
     e2e_traj_metrics = {}
     e2e_traj_raw = []
@@ -1329,8 +1312,7 @@ def main_eval():
             all_metrics['e2e_N_vehicles'] = e2e_traj_metrics['N_vehicles']
 
     # =========================================================================
-    # Parquet trajectory evaluation — for V4/V5, also used for V3 re-eval
-    # UNCHANGED
+    # Parquet trajectory evaluation — UNCHANGED
     # =========================================================================
     parquet_metrics = {}
     if USE_PARQUET_EVAL:
@@ -1349,7 +1331,7 @@ def main_eval():
         all_metrics.update(parquet_metrics)
 
     # =========================================================================
-    # Computational analysis — UNCHANGED (full-model latency @ batch=1)
+    # Computational analysis — UNCHANGED
     # =========================================================================
     print("\nComputational Analysis:")
     try:
@@ -1392,7 +1374,7 @@ def main_eval():
         print(f"  Computational analysis failed: {e}")
 
     # =========================================================================
-    # ## NEW — Agent-density latency / memory sweep (trajectory head only)
+    # Agent-density latency / memory sweep — UNCHANGED
     # =========================================================================
     agent_density_results = {}
     if BENCHMARK_AGENT_DENSITY and use_trajectory and saved_decoder_type in ('mlp', 'social_mlp'):
@@ -1406,7 +1388,9 @@ def main_eval():
         )
 
     # =========================================================================
-    # ## NEW — Save per-sample results for later bootstrap CI computation
+    # Save per-sample results for later bootstrap CI computation
+    # ## CHANGED — also saves all_cached_iou_matrices, in case the CI
+    # script wants to reuse them too rather than recomputing IoU again.
     # =========================================================================
     if SAVE_RESULTS_PATH:
         try:
@@ -1417,8 +1401,9 @@ def main_eval():
                 'config_path':              str(config_path),
                 'checkpoint_path':          str(CHECKPOINT_PATH),
                 'all_sample_results':       all_sample_results,
-                'all_traj_metric_results':  all_traj_metric_results,   # oracle
-                'e2e_traj_raw_results':     e2e_traj_raw,              # end-to-end
+                'all_cached_iou_matrices':  all_cached_iou_matrices,   ## NEW
+                'all_traj_metric_results':  all_traj_metric_results,
+                'e2e_traj_raw_results':     e2e_traj_raw,
                 'confusion_matrix':         confusion_matrix_result,
                 'agent_density_results':    agent_density_results,
                 'aggregated_metrics':       all_metrics,
