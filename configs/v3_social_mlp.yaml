@@ -113,7 +113,7 @@ eval:
   confidence_threshold: 0.1
   nms_iou_threshold: 0.2
   use_rotated_iou: true
-  use_rotated_nms: true
+  use_rotated_nms: false
   use_agent_local_traj: true
   batch_size: 8
   save_results_path: "/content/drive/MyDrive/Amir_Dataset/EvalResults/v3_single_results.pt"   # NEW

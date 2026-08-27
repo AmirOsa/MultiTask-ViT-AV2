@@ -112,7 +112,7 @@ eval:
   confidence_threshold: 0.1
   nms_iou_threshold: 0.2
   use_rotated_iou: true
-  use_rotated_nms: true        # NEW — NOT YET DECIDED 4
+  use_rotated_nms: false        # NEW — NOT YET DECIDED 4
   use_agent_local_traj: true    # NEW — transform traj to agent-local frame
   batch_size: 8
   save_results_path: "/content/drive/MyDrive/Amir_Dataset/EvalResults/v2_results.pt"   # NEW
