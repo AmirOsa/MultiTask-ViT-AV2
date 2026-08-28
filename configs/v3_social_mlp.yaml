@@ -112,11 +112,13 @@ loss:
 eval:
   confidence_threshold: 0.1
   nms_iou_threshold: 0.2
-  use_rotated_iou: true
+  use_rotated_iou: false
   use_rotated_nms: false
   use_agent_local_traj: true
   batch_size: 8
-  save_results_path: "/content/drive/MyDrive/Amir_Dataset/EvalResults/v3_single_results.pt"   # NEW
+  save_results_path: "/content/drive/MyDrive/Amir_Dataset/EvalResults/v3_full_results.pt"   # NEW
+  eval_end_to_end_traj: false
+  benchmark_agent_density: false
 
   trajectory_metrics:
     miss_rate_threshold_m: 2.0

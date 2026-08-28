@@ -111,11 +111,13 @@ loss:
 eval:
   confidence_threshold: 0.1
   nms_iou_threshold: 0.2
-  use_rotated_iou: true
+  use_rotated_iou: false
   use_rotated_nms: false        # NEW — NOT YET DECIDED 4
   use_agent_local_traj: true    # NEW — transform traj to agent-local frame
   batch_size: 8
-  save_results_path: "/content/drive/MyDrive/Amir_Dataset/EvalResults/v2_results.pt"   # NEW
+  save_results_path: "/content/drive/MyDrive/Amir_Dataset/EvalResults/v2_full_results.pt"   # NEW
+  eval_end_to_end_traj: false     # NEW — skip, not needed for Table V
+  benchmark_agent_density: false  # NEW — skip, not needed for Table V
 
   trajectory_metrics:
     # All metric definitions SOURCED: Abdulbaki thesis Section 3.7
