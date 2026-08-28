@@ -4,9 +4,29 @@
 # Original repo: https://github.com/Nadeem202020/VisionTransformer-Intention-Prediction
 # Original file: eval_vit.py
 #
-# [... all original header comments unchanged ...]
+# ## CRITICAL BUG FIX FOR AIBThings 2026 REVISION:
+#  18. [FIXED] Oracle/teacher-forced trajectory evaluation was applying
+#      transform_to_agent_local() to y_hat a SECOND time, even though
+#      the model's raw output is already in agent-local frame (per
+#      training/train.py and training/loss.py, which only transform
+#      the ground truth, never y_hat, before computing the loss).
+#      This double-transform subtracted the GT box's ego-frame position
+#      from an already-local quantity, inflating the reported minADE/
+#      minFDE by roughly the ego-to-vehicle distance (tens of metres)
+#      instead of measuring true trajectory error (~1-2m range).
+#      Confirmed via isolated unit test comparing the correct
+#      (training-consistent) transform path against the buggy path on
+#      synthetic data — error inflated from 0.62m to 20.88m, matching
+#      the vehicle's ego-frame distance (20.62m) almost exactly.
+#      Fixed in two places: the main sensor-loop oracle trajectory
+#      block below, and evaluate_trajectory_parquet() (same pattern,
+#      fixed for correctness though not exercised by V1-V3 configs).
+#      The NEW end-to-end trajectory evaluation (added in the previous
+#      revision pass) was NOT affected — it was written correctly from
+#      the start, transforming only GT and using y_hat as-is, which is
+#      why it produced sane ~1-2m errors while the oracle path did not.
 #
-# ## NEW ADDITIONS FOR REVIEWER RESPONSE (AIBThings 2026 revision):
+# ## OTHER ADDITIONS FOR REVIEWER RESPONSE (AIBThings 2026 revision):
 #  14. [NEW] End-to-end trajectory evaluation — samples trajectory features at
 #      post-NMS PREDICTED box centers instead of GT box centers.
 #  15. [NEW] Agent-density latency/memory sweep (also available standalone
@@ -15,15 +35,8 @@
 #  17. [NEW] Pred-vs-GT IoU matrix caching — computed ONCE per sample in
 #      the main sensor loop, then reused by compute_detection_ap(),
 #      compute_intention_metrics(), compute_distance_binned_map(), and the
-#      confusion-matrix block, instead of each recomputing it independently
-#      (previously up to 5 redundant recomputations of the same matrix per
-#      sample when rotated IoU is enabled). This is a pure performance
-#      optimization — every reported value is byte-for-byte identical to
-#      the uncached version; see utils/metrics.py header for details.
-#      NOTE: this does NOT change NMS cost (rotated NMS is a separate,
-#      pred-vs-pred computation during suppression, not cacheable this way)
-#      or the end-to-end trajectory pass (which reruns detection on a
-#      fresh forward pass and does its own matching).
+#      confusion-matrix block, instead of each recomputing it independently.
+#      This is a pure performance optimization — see utils/metrics.py header.
 
 import sys
 from pathlib import Path
@@ -87,7 +100,14 @@ except ImportError:
 
 
 # =============================================================================
-# Agent-local frame transformation — UNCHANGED
+# Agent-local frame transformation
+# SOURCED: Abdulbaki thesis Section 3.6
+#
+# IMPORTANT: this transforms points FROM ego frame TO agent-local frame.
+# It must only ever be applied to ground-truth trajectories (which are
+# stored in ego frame) — never to y_hat, since the model's raw output is
+# already in agent-local frame by construction (train.py and loss.py only
+# ever transform the GT before computing the loss; y_hat is used as-is).
 # =============================================================================
 
 def transform_to_agent_local(
@@ -202,16 +222,12 @@ def greedy_match_predictions_to_gt(
 
 # =============================================================================
 # Distance-binned mAP
-# ## CHANGED — added optional precomputed_iou_matrices param, same
-# semantics as in utils/metrics.py. GT filtering (BEV bounds, distance
-# bins) now tracks original GT column indices so the cached full matrix
-# can be column-sliced instead of recomputing IoU on the filtered subset.
 # =============================================================================
 
 def compute_distance_binned_map(
     all_sample_results, iou_func,
     use_rotated, bins=None,
-    precomputed_iou_matrices=None,   ## NEW
+    precomputed_iou_matrices=None,
 ):
     """Compute mAP@0.5 broken down by GT box distance from ego vehicle."""
     if bins is None:
@@ -224,7 +240,7 @@ def compute_distance_binned_map(
 
     results_per_bin = {label: [] for _, _, label in bins}
 
-    for idx, sample in enumerate(all_sample_results):   ## CHANGED — enumerate for cache lookup
+    for idx, sample in enumerate(all_sample_results):
         pred_scores = sample['pred_scores']
         pred_boxes  = sample['pred_boxes_xywha']
         gt_boxes    = sample['gt_boxes_xywha']
@@ -236,8 +252,6 @@ def compute_distance_binned_map(
 
         gt_dist = torch.sqrt(gt_boxes[:, 0]**2 + gt_boxes[:, 1]**2)
 
-        # ── Filter GT boxes to BEV bounds only ──
-        # Only evaluate vehicles the model was trained to detect
         in_bev_mask = (
             (gt_boxes[:, 0] >= BEV_X_MIN) &
             (gt_boxes[:, 0] <= BEV_X_MAX) &
@@ -245,28 +259,24 @@ def compute_distance_binned_map(
             (gt_boxes[:, 1] <= BEV_Y_MAX)
         )
 
-        # ## NEW — track original GT column indices through both filters
-        # so the cached full matrix (in original GT order) can be sliced
-        # by column instead of recomputing IoU on the filtered subset.
         orig_gt_idx = torch.arange(num_gt)
 
         gt_boxes    = gt_boxes[in_bev_mask]
         gt_dist     = gt_dist[in_bev_mask]
-        orig_gt_idx = orig_gt_idx[in_bev_mask]   ## NEW
+        orig_gt_idx = orig_gt_idx[in_bev_mask]
         num_gt      = gt_boxes.shape[0]
 
         if num_gt == 0:
             continue
-        # ── End of filter ──
 
-        full_iou_matrix = None   ## NEW
+        full_iou_matrix = None
         if precomputed_iou_matrices is not None:
             full_iou_matrix = precomputed_iou_matrices[idx]
 
         for min_d, max_d, label in bins:
             bin_mask        = (gt_dist >= min_d) & (gt_dist < max_d)
             gt_boxes_bin     = gt_boxes[bin_mask]
-            orig_gt_idx_bin  = orig_gt_idx[bin_mask]   ## NEW
+            orig_gt_idx_bin  = orig_gt_idx[bin_mask]
             num_gt_bin       = gt_boxes_bin.shape[0]
 
             if num_gt_bin == 0:
@@ -275,11 +285,7 @@ def compute_distance_binned_map(
                 results_per_bin[label].append(0.0)
                 continue
 
-            if full_iou_matrix is not None:   ## NEW
-                # Column-slice the cached full matrix by the same GT
-                # indices this bin selected — identical values to
-                # recomputing IoU on gt_boxes_bin, since IoU between a
-                # fixed pred/GT pair never changes.
+            if full_iou_matrix is not None:
                 iou_matrix = full_iou_matrix[:, orig_gt_idx_bin]
             elif use_rotated and ROTATED_IOU_AVAILABLE:
                 iou_matrix = iou_func(pred_boxes.float(), gt_boxes_bin.float())
@@ -316,7 +322,10 @@ def compute_distance_binned_map(
 
 
 # =============================================================================
-# Parquet trajectory evaluation — for V4/V5 — UNCHANGED
+# Parquet trajectory evaluation — for V4/V5
+# ## FIXED — same double-transform bug as the oracle sensor-loop path,
+# fixed here for correctness. y_hat is already in agent-local frame and
+# must be used as-is; only GT gets transformed.
 # =============================================================================
 
 def evaluate_trajectory_parquet(
@@ -330,7 +339,6 @@ def evaluate_trajectory_parquet(
 ) -> dict:
     """
     Evaluate trajectory on parquet val scenarios.
-    (unchanged)
     """
     print(f"\nEvaluating trajectory on parquet val scenarios...")
     print(f"  Parquet dir: {parquet_val_dir}")
@@ -394,6 +402,9 @@ def evaluate_trajectory_parquet(
 
                 N = y_hat.shape[1]
 
+                # ─────────────────────────────────────────────────────────
+                # Focal agent evaluation (MF protocol)
+                # ─────────────────────────────────────────────────────────
                 if eval_focal_only and focal_idx < N:
                     y_hat_focal = y_hat[:, focal_idx:focal_idx+1, :, :]
                     pi_focal = pi[focal_idx:focal_idx+1, :]
@@ -407,18 +418,11 @@ def evaluate_trajectory_parquet(
                         gt_traj_local = transform_to_agent_local(
                             gt_traj_f, focal_box
                         )
-
-                        pred_local_modes = []
-                        for f in range(y_hat_focal.shape[0]):
-                            local_f = transform_to_agent_local(
-                                y_hat_focal[f, :, :, :2],
-                                focal_box
-                            )
-                            pred_local_modes.append(local_f)
-                        pred_pos_local = torch.stack(pred_local_modes, dim=0)
-
-                        y_hat_eval = y_hat_focal.clone()
-                        y_hat_eval[..., :2] = pred_pos_local
+                        # ## FIXED — y_hat_focal is already agent-local
+                        # (model output). Previously this re-transformed
+                        # it via transform_to_agent_local(), corrupting
+                        # the metric. Use directly.
+                        y_hat_eval   = y_hat_focal
                         gt_traj_eval = gt_traj_local
                     else:
                         y_hat_eval   = y_hat_focal
@@ -432,6 +436,9 @@ def evaluate_trajectory_parquet(
                     )
                     focal_traj_results.append(focal_metrics)
 
+                # ─────────────────────────────────────────────────────────
+                # All-agent evaluation (comparable to V2/V3)
+                # ─────────────────────────────────────────────────────────
                 if eval_all_agents and N > 0:
                     N_eval = min(N, gt_traj_all.shape[0])
 
@@ -455,18 +462,8 @@ def evaluate_trajectory_parquet(
                             gt_traj_local = transform_to_agent_local(
                                 gt_traj_inbev, gt_boxes_inbev
                             )
-
-                            pred_local_modes = []
-                            for f in range(y_hat.shape[0]):
-                                local_f = transform_to_agent_local(
-                                    y_hat[f, in_bev_idx, :, :2],
-                                    gt_boxes_inbev
-                                )
-                                pred_local_modes.append(local_f)
-                            pred_pos_local = torch.stack(pred_local_modes, dim=0)
-
-                            y_hat_all_eval = y_hat[:, in_bev_idx].clone()
-                            y_hat_all_eval[..., :2] = pred_pos_local
+                            # ## FIXED — use y_hat as-is, already agent-local.
+                            y_hat_all_eval = y_hat[:, in_bev_idx]
 
                             all_metrics = compute_trajectory_metrics(
                                 y_hat=y_hat_all_eval,
@@ -518,10 +515,8 @@ def evaluate_trajectory_parquet(
 
 
 # =============================================================================
-# End-to-end (non-oracle) trajectory evaluation — UNCHANGED from previous
-# revision (this pass reruns detection fresh and does its own matching,
-# so it is intentionally NOT wired into the main-loop IoU cache — the
-# cache is scoped to the oracle/teacher-forced pass only).
+# End-to-end (non-oracle) trajectory evaluation — UNCHANGED, was already
+# written correctly (only transforms GT, uses y_hat as-is).
 # =============================================================================
 
 def evaluate_trajectory_end_to_end(
@@ -668,6 +663,10 @@ def evaluate_trajectory_end_to_end(
                     if y_hat is None or y_hat.shape[1] == 0:
                         continue
 
+                    # y_hat is already agent-local (relative to the box
+                    # params it was conditioned on, i.e. final_pred_boxes).
+                    # Only GT needs transforming — correct as originally
+                    # written.
                     if use_agent_local_traj:
                         gt_traj_eval = transform_to_agent_local(
                             final_gt_traj, final_pred_boxes
@@ -871,7 +870,8 @@ def main_eval():
     print(f"  End-to-end traj eval:  {EVAL_END_TO_END_TRAJ}")
     print(f"  Agent-density bench:   {BENCHMARK_AGENT_DENSITY}")
     print(f"  Save results to:       {SAVE_RESULTS_PATH or '(disabled)'}")
-    print(f"  IoU matrix caching:    ENABLED (perf optimization)")   ## NEW
+    print(f"  IoU matrix caching:    ENABLED (perf optimization)")
+    print(f"  Oracle traj double-transform bug: FIXED")   ## NEW
     print(f"{'='*60}\n")
 
     checkpoint_path = Path(CHECKPOINT_PATH)
@@ -990,20 +990,13 @@ def main_eval():
         EVAL_USE_ROTATED_NMS = False
 
     # =========================================================================
-    # Sensor inference loop — detection + intention + auxiliary (oracle)
-    # trajectory. ## CHANGED: now also builds all_cached_iou_matrices,
-    # computing each sample's pred-vs-GT IoU matrix exactly once, reused
-    # by every metric function below instead of being recomputed per call.
+    # Sensor inference loop
     # =========================================================================
     print("Running sensor inference...")
     all_sample_results       = []
     all_traj_metric_results  = []
-    all_cached_iou_matrices  = []   ## NEW — one entry per sample, aligned
-                                     # 1:1 with all_sample_results by index
-    run_traj = False   ## FIX — safe default so this variable always exists
-                        # even if every batch is skipped/None (e.g. missing
-                        # precomputed intent files), preventing the
-                        # UnboundLocalError seen previously.
+    all_cached_iou_matrices  = []
+    run_traj = False
 
     with torch.inference_mode():
         pbar = tqdm(val_loader, desc=f"Sensor Eval [{MODEL_VERSION}]", unit="batch")
@@ -1073,18 +1066,13 @@ def main_eval():
                         print(f"Error post-processing b_idx={b_idx}: {e}")
 
                     gt = gt_list_cpu[b_idx]
-                    sample_gt_boxes = gt.get('boxes_xywha', torch.empty((0, 5)))   ## NEW
+                    sample_gt_boxes = gt.get('boxes_xywha', torch.empty((0, 5)))
                     all_sample_results.append({
                         **sample_pred,
                         'gt_boxes_xywha': sample_gt_boxes,
                         'gt_intentions':  gt.get('intentions',  torch.empty(0, dtype=torch.long))
                     })
 
-                    # ## NEW — compute the pred-vs-GT IoU matrix for this
-                    # sample exactly once, here, and cache it. Every
-                    # downstream metric function (mAP, intention matching,
-                    # distance-binned mAP, confusion matrix) will reuse
-                    # this instead of recomputing it independently.
                     pred_boxes_s = sample_pred['pred_boxes_xywha']
                     if pred_boxes_s.shape[0] > 0 and sample_gt_boxes.shape[0] > 0:
                         if EVAL_USE_ROTATED_IOU and ROTATED_IOU_AVAILABLE:
@@ -1100,7 +1088,19 @@ def main_eval():
                         cached_matrix = None
                     all_cached_iou_matrices.append(cached_matrix)
 
-                # Auxiliary (oracle) trajectory metrics — UNCHANGED
+                # =========================================================
+                # Auxiliary (oracle) trajectory metrics
+                # ## FIXED — see module-level header for full explanation.
+                # y_hat is already in agent-local frame (that's what the
+                # model was trained to output — see train.py, which only
+                # transforms GT before computing the loss, never y_hat).
+                # Previously this block re-transformed y_hat a SECOND time
+                # via transform_to_agent_local(), incorrectly subtracting
+                # the GT box's ego-frame position from an already-local
+                # quantity. This inflated minADE/minFDE to roughly the
+                # ego-to-vehicle distance (tens of metres) instead of the
+                # true trajectory error. Fixed by using y_hat as-is.
+                # =========================================================
                 if run_traj and y_hat is not None:
                     gt_b0 = gt_list_cpu[0]
                     if gt_b0 is not None and 'future_traj_ego' in gt_b0:
@@ -1156,18 +1156,9 @@ def main_eval():
                                     gt_traj_inbev, gt_boxes_inbev
                                 )
 
-                                F_modes = y_hat.shape[0]
-                                pred_local_modes = []
-                                for f in range(F_modes):
-                                    local_f = transform_to_agent_local(
-                                        y_hat[f, in_bev_idx, :, :2],
-                                        gt_boxes_inbev
-                                    )
-                                    pred_local_modes.append(local_f)
-                                pred_pos_local = torch.stack(pred_local_modes, dim=0)
-
-                                y_hat_local = y_hat[:, in_bev_idx].clone()
-                                y_hat_local[..., :2] = pred_pos_local
+                                # ## FIXED — y_hat is already agent-local;
+                                # use it directly instead of re-transforming.
+                                y_hat_local = y_hat[:, in_bev_idx]
 
                                 traj_m = compute_trajectory_metrics(
                                     y_hat=y_hat_local,
@@ -1184,19 +1175,17 @@ def main_eval():
 
     # =========================================================================
     # Compute and print sensor metrics
-    # ## CHANGED — now passes all_cached_iou_matrices through so IoU is
-    # not recomputed by these functions.
     # =========================================================================
     print("\nComputing detection mAP...")
     det_metrics = compute_detection_ap(
         all_sample_results, iou_func, EVAL_USE_ROTATED_IOU,
-        precomputed_iou_matrices=all_cached_iou_matrices,   ## NEW
+        precomputed_iou_matrices=all_cached_iou_matrices,
     )
 
     print("Computing intention metrics...")
     intent_metrics = compute_intention_metrics(
         all_sample_results, iou_func, EVAL_USE_ROTATED_IOU,
-        precomputed_iou_matrices=all_cached_iou_matrices,   ## NEW
+        precomputed_iou_matrices=all_cached_iou_matrices,
     )
 
     traj_metrics = {}
@@ -1213,13 +1202,13 @@ def main_eval():
               f"teacher-forced/oracle detections)")
 
     # =========================================================================
-    # Distance-binned mAP — ## CHANGED — passes cache through
+    # Distance-binned mAP
     # =========================================================================
     print("\nDistance-binned mAP@0.5:")
     try:
         dist_map = compute_distance_binned_map(
             all_sample_results, iou_func, EVAL_USE_ROTATED_IOU,
-            precomputed_iou_matrices=all_cached_iou_matrices,   ## NEW
+            precomputed_iou_matrices=all_cached_iou_matrices,
         )
         for label, ap in dist_map.items():
             print(f"  mAP@0.5 {label:<10}: {ap:.4f}")
@@ -1228,7 +1217,7 @@ def main_eval():
         print(f"  Distance-binned mAP failed: {e}")
 
     # =========================================================================
-    # Intention confusion matrix — ## CHANGED — uses cached matrix
+    # Intention confusion matrix
     # =========================================================================
     confusion_matrix_result = None
     if SKLEARN_AVAILABLE:
@@ -1238,7 +1227,7 @@ def main_eval():
             matched_pred_all = []
             matched_gt_all   = []
 
-            for idx, sample in enumerate(all_sample_results):   ## CHANGED — enumerate for cache lookup
+            for idx, sample in enumerate(all_sample_results):
                 pred_scores  = sample['pred_scores']
                 pred_boxes   = sample['pred_boxes_xywha']
                 pred_intents = sample['pred_intentions']
@@ -1248,7 +1237,7 @@ def main_eval():
                 if pred_boxes.shape[0] == 0 or gt_boxes.shape[0] == 0:
                     continue
 
-                iou_mat = all_cached_iou_matrices[idx]   ## CHANGED — was: recomputed via iou_func here
+                iou_mat = all_cached_iou_matrices[idx]
                 if iou_mat is None:
                     continue
 
@@ -1286,7 +1275,7 @@ def main_eval():
             print(f"  Confusion matrix failed: {e}")
 
     # =========================================================================
-    # End-to-end (non-oracle) trajectory evaluation — UNCHANGED
+    # End-to-end (non-oracle) trajectory evaluation
     # =========================================================================
     e2e_traj_metrics = {}
     e2e_traj_raw = []
@@ -1312,7 +1301,7 @@ def main_eval():
             all_metrics['e2e_N_vehicles'] = e2e_traj_metrics['N_vehicles']
 
     # =========================================================================
-    # Parquet trajectory evaluation — UNCHANGED
+    # Parquet trajectory evaluation
     # =========================================================================
     parquet_metrics = {}
     if USE_PARQUET_EVAL:
@@ -1331,7 +1320,7 @@ def main_eval():
         all_metrics.update(parquet_metrics)
 
     # =========================================================================
-    # Computational analysis — UNCHANGED
+    # Computational analysis
     # =========================================================================
     print("\nComputational Analysis:")
     try:
@@ -1374,7 +1363,7 @@ def main_eval():
         print(f"  Computational analysis failed: {e}")
 
     # =========================================================================
-    # Agent-density latency / memory sweep — UNCHANGED
+    # Agent-density latency / memory sweep
     # =========================================================================
     agent_density_results = {}
     if BENCHMARK_AGENT_DENSITY and use_trajectory and saved_decoder_type in ('mlp', 'social_mlp'):
@@ -1389,8 +1378,6 @@ def main_eval():
 
     # =========================================================================
     # Save per-sample results for later bootstrap CI computation
-    # ## CHANGED — also saves all_cached_iou_matrices, in case the CI
-    # script wants to reuse them too rather than recomputing IoU again.
     # =========================================================================
     if SAVE_RESULTS_PATH:
         try:
@@ -1401,7 +1388,7 @@ def main_eval():
                 'config_path':              str(config_path),
                 'checkpoint_path':          str(CHECKPOINT_PATH),
                 'all_sample_results':       all_sample_results,
-                'all_cached_iou_matrices':  all_cached_iou_matrices,   ## NEW
+                'all_cached_iou_matrices':  all_cached_iou_matrices,
                 'all_traj_metric_results':  all_traj_metric_results,
                 'e2e_traj_raw_results':     e2e_traj_raw,
                 'confusion_matrix':         confusion_matrix_result,
