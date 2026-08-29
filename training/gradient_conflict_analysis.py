@@ -36,6 +36,22 @@
 # uses exactly this pairwise cosine similarity test to detect conflicting
 # gradients before applying gradient projection.
 #
+# ## FIX — memory leak resolved:
+#   The original version of this script accumulated GPU memory across
+#   batches and OOM'd after ~2 batches. Root cause: gradient vectors
+#   collected via get_backbone_grad_vector() stayed on GPU across all four
+#   per-task backward() calls (three of which use retain_graph=True,
+#   keeping forward-pass activations alive), and nothing explicitly freed
+#   the forward outputs, loss tensors, or graph between batch iterations.
+#   Fixed by: (1) moving each task's gradient vector to CPU immediately
+#   after computing it, since only the cheap cosine-similarity step needs
+#   it afterward; (2) explicit del + torch.cuda.empty_cache() in a
+#   finally block after every batch, success or failure; (3) reduced
+#   DataLoader batch_size (8 -> 2) for this script specifically, since
+#   four full backbone backward passes per batch is far more memory-
+#   intensive than a single training step and doesn't need to match the
+#   training batch size to produce valid gradient-direction estimates.
+#
 # Usage:
 #   PYTHONPATH=/content/MultiTask-ViT-AV2 python \
 #       training/gradient_conflict_analysis.py \
@@ -167,11 +183,6 @@ def get_backbone_grad_vector(model: nn.Module) -> torch.Tensor | None:
         if p.grad is not None:
             grads.append(p.grad.detach().reshape(-1))
         else:
-            # Parameter received no gradient this backward pass — treat
-            # its contribution as zero, so shapes stay consistent across
-            # tasks even if a task's loss graph doesn't touch every
-            # backbone parameter (unlikely here, since backbone feeds
-            # all heads, but handled defensively).
             grads.append(torch.zeros(p.numel(), device=p.device))
     if not grads:
         return None
@@ -193,9 +204,11 @@ def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
 #
 # Runs one forward pass and returns each task's loss as a SEPARATE scalar
 # tensor, still attached to the autograd graph, so each can be backward()'d
-# independently. This mirrors the loss computation in training/loss.py's
-# DetectionIntentionLoss and TrajectoryLoss, but keeps the four components
-# (cls, box, intent, traj) unsummed so we can isolate their gradients.
+# independently. Reuses DetectionIntentionLoss's validated anchor-matching
+# logic by calling it three times with different weight combinations
+# (1,0,0 / 0,1,0 / 0,0,1) rather than duplicating that logic — matching is
+# cheap relative to the backbone forward/backward, so this is not a
+# meaningful cost concern for a small number of analysis batches.
 # =============================================================================
 
 def compute_task_losses(
@@ -217,24 +230,6 @@ def compute_task_losses(
     y_hat = outputs.get("y_hat")
     pi    = outputs.get("pi")
 
-    # --- Detection + intention losses, computed via the SAME anchor
-    # matching logic as training, but we need cls/box/intent as separate
-    # tensors rather than the combined scalar DetectionIntentionLoss
-    # normally returns. Easiest correct way: call the loss module three
-    # times isn't right either (matching is stochastic-free but the
-    # weighted sum inside forward() combines them). Instead we replicate
-    # by calling the same forward() and reading its returned components
-    # BEFORE they were weighted-summed — but DetectionIntentionLoss only
-    # returns the already-summed weighted total, not the raw components
-    # as differentiable tensors (they are  detached  for logging).
-    #
-    # To get REAL differentiable per-task losses without duplicating all
-    # of DetectionIntentionLoss's anchor-matching logic, we instead call
-    # the loss module three times with the OTHER two weights set to zero
-    # via direct attribute overrides, restoring them after. This reuses
-    # 100% of the existing, validated anchor-matching code with no
-    # duplication, at the cost of 3x forward-loss-compute (matching is
-    # cheap CPU/GPU tensor ops, not a bottleneck here).
     orig_weights = (
         det_intent_loss_fn.cls_weight,
         det_intent_loss_fn.box_weight,
@@ -256,8 +251,6 @@ def compute_task_losses(
     intent_only = det_intent_loss_fn(det_cls_logits, det_box_preds, intention_logits, anchors, gt_list)
     intent_loss = intent_only["loss"]
 
-    # Restore original weights (harmless here since we don't reuse this
-    # loss_fn instance for anything else afterward, but good hygiene)
     det_intent_loss_fn.cls_weight, det_intent_loss_fn.box_weight, det_intent_loss_fn.intent_weight = orig_weights
 
     # --- traj_loss, using the SAME active-agent filtering as train.py ---
@@ -310,6 +303,12 @@ def main():
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--num_batches", type=int, default=15,
                         help="Number of val batches to analyze.")
+    parser.add_argument("--batch_size", type=int, default=2,
+                        help="Batch size for this analysis. Kept small since "
+                             "four full backbone backward passes per batch "
+                             "are far more memory-intensive than a single "
+                             "training step; does not need to match the "
+                             "training batch size.")
     parser.add_argument("--output_json", type=str, default="",
                         help="Optional path to save results as JSON.")
     args = parser.parse_args()
@@ -326,8 +325,8 @@ def main():
     VAL_DATA_DIR = get_nested(cfg, 'data', 'val_dir', default='')
     val_dataset = ArgoverseIntentNetDataset(data_dir=VAL_DATA_DIR, is_train=False)
     val_loader = DataLoader(
-        val_dataset, batch_size=8, shuffle=True,   # shuffle=True so batches
-        num_workers=0, collate_fn=collate_fn,       # aren't all from one log
+        val_dataset, batch_size=args.batch_size, shuffle=True,
+        num_workers=0, collate_fn=collate_fn,
     )
 
     vit_model_name = get_nested(cfg, 'model', 'backbone', 'vit_model_name_lidar', default='vit_small_patch8_224')
@@ -362,7 +361,7 @@ def main():
     batches_used = 0
 
     print(f"Running gradient-conflict analysis over up to {args.num_batches} "
-          f"batches for tasks: {task_names}\n")
+          f"batches (batch_size={args.batch_size}) for tasks: {task_names}\n")
 
     for batch_data in val_loader:
         if batches_used >= args.num_batches:
@@ -374,47 +373,61 @@ def main():
         map_bev   = batch_data["map_bev"].to(device)
         gt_list   = batch_data["gt_list"]
 
+        cls_loss = box_loss = intent_loss = traj_loss = None
+        task_grads = {}
+
         try:
             cls_loss, box_loss, intent_loss, traj_loss = compute_task_losses(
                 model, det_intent_loss_fn, traj_loss_fn,
                 lidar_bev, map_bev, gt_list, anchors,
                 use_trajectory, device,
             )
+
+            task_losses = {'cls': cls_loss, 'box': box_loss, 'intent': intent_loss}
+            if use_trajectory:
+                task_losses['traj'] = traj_loss
+
+            if any(v is None for v in task_losses.values()):
+                continue
+
+            # --- Compute one gradient vector per task, on the SAME forward
+            # pass's graph. retain_graph=True on all but the last backward()
+            # call, since each call otherwise frees the shared backbone
+            # activations needed by the other tasks' backward passes.
+            task_list = list(task_losses.items())
+            for i, (name, loss_val) in enumerate(task_list):
+                model.zero_grad(set_to_none=True)
+                is_last = (i == len(task_list) - 1)
+                loss_val.backward(retain_graph=not is_last)
+                grad_vec = get_backbone_grad_vector(model)
+                # ## FIX — move to CPU immediately; only cosine similarity
+                # (cheap) needs this afterward, so don't hold it on GPU.
+                task_grads[name] = grad_vec.cpu() if grad_vec is not None else None
+
+            model.zero_grad(set_to_none=True)
+
+            for a, b in pair_names:
+                sim = cosine_similarity(task_grads[a], task_grads[b])
+                if not np.isnan(sim):
+                    similarities_per_pair[f"{a}_vs_{b}"].append(sim)
+
+            batches_used += 1
+            print(f"  Batch {batches_used}/{args.num_batches} processed.")
+
+        except torch.cuda.OutOfMemoryError as e:
+            print(f"  Skipping batch due to OOM: {e}")
         except Exception as e:
             print(f"  Skipping batch due to error: {e}")
-            continue
 
-        task_losses = {'cls': cls_loss, 'box': box_loss, 'intent': intent_loss}
-        if use_trajectory:
-            task_losses['traj'] = traj_loss
-
-        # Skip this batch entirely if any required task loss is missing
-        # (e.g. traj_loss is None because no active agents in this batch)
-        if any(v is None for v in task_losses.values()):
-            continue
-
-        # --- Compute one gradient vector per task, on the SAME forward
-        # pass's graph. We must retain_graph=True on all but the last
-        # backward() call, since each call otherwise frees the shared
-        # backbone activations needed by the other tasks' backward passes.
-        task_grads = {}
-        task_list = list(task_losses.items())
-        for i, (name, loss_val) in enumerate(task_list):
+        finally:
+            # ## FIX — explicit cleanup after EVERY batch, success or
+            # failure. This is the actual leak fix: without this, forward/
+            # backward graphs and their activations accumulate across
+            # iterations and eventually exhaust GPU memory.
+            del cls_loss, box_loss, intent_loss, traj_loss
+            del lidar_bev, map_bev, task_grads
             model.zero_grad(set_to_none=True)
-            is_last = (i == len(task_list) - 1)
-            loss_val.backward(retain_graph=not is_last)
-            task_grads[name] = get_backbone_grad_vector(model)
-
-        model.zero_grad(set_to_none=True)
-
-        # --- Pairwise cosine similarity for this batch ---
-        for a, b in pair_names:
-            sim = cosine_similarity(task_grads[a], task_grads[b])
-            if not np.isnan(sim):
-                similarities_per_pair[f"{a}_vs_{b}"].append(sim)
-
-        batches_used += 1
-        print(f"  Batch {batches_used}/{args.num_batches} processed.")
+            torch.cuda.empty_cache()
 
     print(f"\n{'='*60}")
     print(f"  Gradient Conflict Analysis Results ({model_version})")
